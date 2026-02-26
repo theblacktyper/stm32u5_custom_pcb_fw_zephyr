@@ -1,3 +1,5 @@
+Summary: This repository holds the initial Zephyr RTOS app that demonstrates functional and interactive LEDs, user button, camera, display, alongside the "hello world" tflite-micro sample (sine wave prediction) running.
+
 # kk_edge_ai_tflm_hello
 
 Camera + display app with a **TensorFlow Lite Micro (TFLM) hello_world** sine model overlay on the camera frame.
