@@ -1,0 +1,7 @@
+# Out-of-tree STM32 DCMI driver for STM32U5 (GPDMA).
+# Use compatible "st,stm32u5-dcmi" in the DCMI node and disable the
+# in-tree driver (CONFIG_VIDEO_STM32_DCMI=n) for the board so this driver is used.
+name: stm32u5_dcmi
+build:
+  cmake: zephyr
+  kconfig: Kconfig

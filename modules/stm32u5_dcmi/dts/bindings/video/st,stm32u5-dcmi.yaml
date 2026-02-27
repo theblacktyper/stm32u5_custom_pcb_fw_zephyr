@@ -1,0 +1,26 @@
+# Binding for out-of-tree STM32 DCMI driver (STM32U5 GPDMA).
+# Same schema as st,stm32-dcmi; use this compatible so the in-tree driver
+# does not bind and this module's driver is used instead.
+description: |
+  STM32 DCMI for U5 (GPDMA). Same as st,stm32-dcmi but for the out-of-tree
+  driver that uses GPDMA (DMA_NORMAL, etc.).
+
+compatible: "st,stm32u5-dcmi"
+
+include: [base.yaml, pinctrl-device.yaml]
+
+properties:
+  interrupts:
+    required: true
+  dmas:
+    required: true
+    description: |
+      phandle of DMA controller (e.g. GPDMA1 for STM32U5).
+  clocks:
+    required: true
+  reg:
+    required: true
+
+child-binding:
+  child-binding:
+    include: video-interfaces.yaml

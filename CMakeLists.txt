@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 cmake_minimum_required(VERSION 3.20.0)
+# Ensure out-of-tree STM32U5 DCMI module is loaded (required for st,stm32u5-dcmi)
+if(NOT ZEPHYR_EXTRA_MODULES)
+  set(ZEPHYR_EXTRA_MODULES "${CMAKE_CURRENT_SOURCE_DIR}/modules/stm32u5_dcmi" CACHE STRING "Extra Zephyr modules")
+endif()
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(kk_edge_ai_tflm_hello)
 

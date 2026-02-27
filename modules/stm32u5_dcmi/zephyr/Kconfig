@@ -1,0 +1,16 @@
+# STM32U5 DCMI (GPDMA) out-of-tree driver
+# Use with compatible "st,stm32u5-dcmi" and CONFIG_VIDEO_STM32_DCMI=n for the board.
+
+config VIDEO_STM32U5_DCMI
+	bool "STM32U5 DCMI driver (GPDMA)"
+	default y
+	depends on DT_HAS_ST_STM32U5_DCMI_ENABLED
+	select PINCTRL
+	select USE_STM32_HAL_DCMI
+	select DMA
+	select USE_STM32_HAL_DMA
+	select USE_STM32_HAL_DMA_EX
+	help
+	  Out-of-tree DCMI driver for STM32U5 with GPDMA support.
+	  Requires board to use compatible "st,stm32u5-dcmi" and
+	  CONFIG_VIDEO_STM32_DCMI=n.

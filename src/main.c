@@ -25,13 +25,15 @@ LOG_MODULE_REGISTER(kk_edge_ai, LOG_LEVEL_INF);
 #include <stdlib.h>
 #include <string.h>
 
-/* size of stack area used by each thread */
-#define STACKSIZE 1024
+/* size of stack area used by threads */
+#define DEFAULT_STACKSIZE    1024
+#define INFERENCE_STACKSIZE  2048
+#define CAMERA_STACKSIZE     4096
 
 /* scheduling priority: lower number = higher priority in Zephyr */
-//#define EQUAL_PRIORITY    7
-#define PRIORITY_LED      5   /* LEDs preempt camera/display for crisp toggling */
-#define PRIORITY_CAMERA   7   /* camera + display */
+#define EQUAL_PRIORITY    7
+#define PRIORITY_LED      EQUAL_PRIORITY//5   /* LEDs preempt camera/display for crisp toggling */
+#define PRIORITY_CAMERA   EQUAL_PRIORITY//7   /* camera + display */
 
 #define LED0_NODE DT_ALIAS(led0)
 #define LED1_NODE DT_ALIAS(led1)
@@ -68,7 +70,6 @@ const struct device *video_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_camera));
 #define DISPLAY_H         135
 #define FRAME_X_OFFSET    ((DISPLAY_W - CAMERA_W) / 2)   /* center 160 on 240 */
 #define FRAME_Y_OFFSET    ((DISPLAY_H - CAMERA_H) / 2)   /* center 120 on 135 */
-#define CAMERA_STACKSIZE  4096
 
 #define STANDBY_TEXT_MAX_LEN 24
 
@@ -78,12 +79,6 @@ const struct device *video_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_camera));
  * produce a continuous stream. Both modes use start/stop per frame.
  */
 #define CAMERA_CAPTURE_MODE_CONTINUOUS  0  // TBD: need implement REAL continuous mode
-
-/*
- * If camera image colours look wrong (R/B swapped), change to 1.
- * This byte-swaps each RGB565 pixel during scaling.
- */
-#define CAMERA_BYTE_SWAP  1
 
 static atomic_t show_camera_frame = ATOMIC_INIT(0);
 static K_SEM_DEFINE(capture_sem, 0, 1);
@@ -447,20 +442,23 @@ static void button_pressed_cb(const struct device *dev,
  * (dx, dy) are display coordinates; color is 0x00RRGGBB.
  */
 static void set_display_pixel_rgb565(uint8_t *dst, uint16_t dx, uint16_t dy,
-				     uint32_t color)
+                                     uint32_t color)
 {
-	if (dx >= DISPLAY_W || dy >= DISPLAY_H) {
-		return;
-	}
-	uint8_t r = (color >> 16) & 0xFF;
-	uint8_t g = (color >>  8) & 0xFF;
-	uint8_t b =  color        & 0xFF;
-	uint16_t c565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
-#if CAMERA_BYTE_SWAP
-	c565 = (c565 >> 8) | (c565 << 8);
-#endif
-	uint32_t offset = (uint32_t)dy * DISPLAY_W + dx;
-	((uint16_t *)dst)[offset] = c565;
+    if (dx >= DISPLAY_W || dy >= DISPLAY_H) {
+        return;
+    }
+
+    uint8_t r = (color >> 16) & 0xFF;
+    uint8_t g = (color >>  8) & 0xFF;
+    uint8_t b =  color        & 0xFF;
+    uint16_t c565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+
+    /* Write as [high byte][low byte] to match display expectations */
+    uint32_t pixel_index = (uint32_t)dy * DISPLAY_W + dx;
+    uint32_t byte_index  = pixel_index * 2U;
+
+    dst[byte_index]     = (uint8_t)((c565 >> 8) & 0xFF);
+    dst[byte_index + 1] = (uint8_t)(c565 & 0xFF);
 }
 
 /*
@@ -542,19 +540,22 @@ static void draw_sine_overlay(uint8_t *dst)
  */
 static void copy_frame_to_display(const uint8_t *src, uint8_t *dst)
 {
+	/* One-time clear of borders; camera region is fully overwritten each frame. */
+	static int borders_cleared;
+
 	const uint16_t *s = (const uint16_t *)src;
 	uint16_t *d = (uint16_t *)dst;
 
-	memset(dst, 0x00, DISPLAY_W * DISPLAY_H * sizeof(uint16_t));
+	if (!borders_cleared) {
+		memset(dst, 0x00, DISPLAY_W * DISPLAY_H * sizeof(uint16_t));
+		borders_cleared = 1;
+	}
 
 	for (int y = 0; y < CAMERA_H; y++) {
-		for (int x = 0; x < CAMERA_W; x++) {
-			uint16_t pixel = s[y * CAMERA_W + x];
-        #if CAMERA_BYTE_SWAP
-			pixel = (pixel >> 8) | (pixel << 8);
-        #endif
-			d[(FRAME_Y_OFFSET + y) * DISPLAY_W + FRAME_X_OFFSET + x] = pixel;
-		}
+		const uint16_t *src_row = s + y * CAMERA_W;
+		uint16_t *dst_row = d + (FRAME_Y_OFFSET + y) * DISPLAY_W + FRAME_X_OFFSET;
+
+		memcpy(dst_row, src_row, CAMERA_W * sizeof(uint16_t));
 	}
 
 	draw_sine_overlay(dst);
@@ -993,6 +994,31 @@ int main(void)
 	}
 
 	/*
+	 * Override OV5640 FORMAT CONTROL 00 (0x4300) to 0x61 (RGB565 2X8 BE) so
+	 * the sensor output matches the display byte order and no per-pixel
+	 * swap is needed. Done here so we don't have to patch the Zephyr driver.
+	 */
+	{
+		const struct device *i2c_dev = DEVICE_DT_GET(DT_PARENT(DT_NODELABEL(ov5640)));
+		uint8_t ov5640_addr = DT_REG_ADDR(DT_NODELABEL(ov5640));
+		uint8_t fmt_ctrl[] = { 0x43, 0x00, 0x61 }; /* 0x4300 = 0x61 */
+
+		if (device_is_ready(i2c_dev)) {
+			int ret = i2c_write(i2c_dev, fmt_ctrl, sizeof(fmt_ctrl), ov5640_addr);
+			if (ret != 0) 
+			{
+				LOG_WRN("> OV5640 0x4300 override failed: %d (colors may be wrong)", ret);
+			}
+			// else 
+			// {
+			// 	LOG_INF("> OV5640 0x4300 set to 0x61 (RGB565 BE)");
+			// }
+		} else {
+			LOG_WRN("> OV5640 I2C bus not ready, skip 0x4300 override");
+		}
+	}
+
+	/*
 	 * Flip controls: video_set_ctrl skips the driver when new value equals
 	 * current (default 0). Resolution params set 0x3820/0x3821, so we must
 	 * force a write by setting the opposite value first.
@@ -1028,20 +1054,23 @@ int main(void)
 }
 
 /* Dedicated inference thread: runs TFLM once to fill overlay buffer, then exits. */
-#define INFERENCE_STACKSIZE  2048
 static void inference_thread(void)
 {
 	tflm_sine_setup();
-	tflm_sine_fill_overlay_buffer();
+	// while (1)
+	// {
+		tflm_sine_fill_overlay_buffer();
+	// 	k_msleep(1000);
+	// }
 }
 
 K_THREAD_DEFINE(inference_id, INFERENCE_STACKSIZE, inference_thread, NULL, NULL, NULL,
 		PRIORITY_CAMERA, 0, 0);
-K_THREAD_DEFINE(display_id, STACKSIZE, display_thread, NULL, NULL, NULL,
+K_THREAD_DEFINE(display_id, DEFAULT_STACKSIZE, display_thread, NULL, NULL, NULL,
 		PRIORITY_CAMERA, 0, 0);
-K_THREAD_DEFINE(blink0_id, STACKSIZE, blink0, NULL, NULL, NULL,
+K_THREAD_DEFINE(blink0_id, DEFAULT_STACKSIZE, blink0, NULL, NULL, NULL,
 		PRIORITY_LED, 0, 0);
-K_THREAD_DEFINE(blink1_id, STACKSIZE, blink1, NULL, NULL, NULL,
+K_THREAD_DEFINE(blink1_id, DEFAULT_STACKSIZE, blink1, NULL, NULL, NULL,
 		PRIORITY_LED, 0, 0);
 K_THREAD_DEFINE(camera_id, CAMERA_STACKSIZE, camera_thread, NULL, NULL, NULL,
 		PRIORITY_CAMERA, 0, 0);
