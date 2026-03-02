@@ -11,6 +11,7 @@
 LOG_MODULE_REGISTER(kk_edge_ai, LOG_LEVEL_INF);
 
 #include "main_functions.h"  /* TFLM person detection: setup (inference thread), run (camera thread) */
+#include "tflm_hello_world/model_settings.h"  /* kNumCols/kNumRows = 96x96 NN crop */
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/display.h>
@@ -69,6 +70,7 @@ const struct device *ov5640 = DEVICE_DT_GET(DT_NODELABEL(ov5640));
 const struct device *video_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_camera));
 
 static volatile uint8_t is_cam_capture_started = 0;
+static volatile uint8_t is_zoom_2x = 0;
 
 /*
  * STM32U5 GPDMA block-transfer limit is 65 535 bytes (16-bit BNDT register).
@@ -125,17 +127,77 @@ static const struct led led1 = {
 static struct gpio_callback button_cb_data;
 static struct gpio_callback button_sec_cb_data;
 
+/* ---- OV5640 zoom control (1x / 2x) -------------------------------------- */
+
+enum ov5640_zoom_level {
+	OV5640_ZOOM_1X = 0,
+	OV5640_ZOOM_2X = 1,
+};
+
+static volatile enum ov5640_zoom_level requested_zoom = OV5640_ZOOM_1X;
+
+static void ov5640_enable_scaler(void)
+{
+	const struct device *i2c_dev = DEVICE_DT_GET(DT_PARENT(DT_NODELABEL(ov5640)));
+	const uint8_t ov5640_addr = DT_REG_ADDR(DT_NODELABEL(ov5640));
+	uint8_t addr_buf[2] = { 0x50, 0x01 };
+	uint8_t v;
+
+	if (!device_is_ready(i2c_dev)) {
+		LOG_WRN("OV5640 I2C bus not ready, skip scaler enable");
+		return;
+	}
+
+	if (i2c_write_read(i2c_dev, ov5640_addr, addr_buf, sizeof(addr_buf), &v, 1) != 0) {
+		LOG_WRN("OV5640 read 0x5001 failed, skip scaler enable");
+		return;
+	}
+
+	v |= BIT(5); /* ISP scale enable */
+	uint8_t buf[3] = { 0x50, 0x01, v };
+	if (i2c_write(i2c_dev, buf, sizeof(buf), ov5640_addr) != 0) {
+		LOG_WRN("OV5640 write 0x5001 failed, scaler may be off");
+	}
+}
+
+static void ov5640_set_zoom_1x(void)
+{
+	/* Application-level zoom only: sensor remains in its configured window. */
+	is_zoom_2x = 0;
+}
+
+static void ov5640_set_zoom_2x(void)
+{
+	/* Application-level zoom only: sensor remains in its configured window. */
+	is_zoom_2x = 1;
+}
+
+static void ov5640_zoom_work_handler(struct k_work *work);
+static K_WORK_DEFINE(ov5640_zoom_work, ov5640_zoom_work_handler);
+
+static void ov5640_zoom_work_handler(struct k_work *work)
+{
+	enum ov5640_zoom_level target = requested_zoom;
+
+	if (target == OV5640_ZOOM_2X && !is_zoom_2x) {
+		ov5640_set_zoom_2x();
+	} else if (target == OV5640_ZOOM_1X && is_zoom_2x) {
+		ov5640_set_zoom_1x();
+	}
+}
+
 /* Button(s) callback */
 // Button 2 (sw0)
 static void button_pressed_cb(const struct device *dev,
 			      struct gpio_callback *cb,
 			      uint32_t pins)
 {
-	if (!is_cam_capture_started)
+	if (!is_cam_capture_started) {
 		k_sem_give(&capture_sem);
-	else
-	{
-		/* Implement Zoom - */
+	} else {
+		/* Zoom - : request 1x when capture is running */
+		requested_zoom = OV5640_ZOOM_1X;
+		k_work_submit(&ov5640_zoom_work);
 	}
 }
 // Button 1 (sw1)
@@ -143,9 +205,10 @@ static void button_sec_pressed_cb(const struct device *dev,
 			      struct gpio_callback *cb,
 			      uint32_t pins)
 {
-	if (is_cam_capture_started)
-	{
-		/* Implement Zoom + */
+	if (is_cam_capture_started) {
+		/* Zoom + : request 2x when capture is running */
+		requested_zoom = OV5640_ZOOM_2X;
+		k_work_submit(&ov5640_zoom_work);
 	}
 }
 
@@ -541,23 +604,63 @@ static void draw_person_overlay(uint8_t *dst, int8_t person_score, int8_t no_per
 {
 	/* Person score as percentage (person class only) */
 	int person_pct = clamp_pct((int)(person_score + 128) * 100 / 256);
-	/* Bar: green when person >= 50%, otherwise red */
-	int person_at_least_half = (person_pct >= 50);
+	/* Border: green when person >= 50%, otherwise red */
+	int person_at_least_half = (person_pct >= 75);
 	uint16_t bar_color = person_at_least_half ? COLOR_GREEN : COLOR_RED;
 
-	/* Draw bar at the very top (y = 0), 160px wide centered */
-	int bar_y = 0;
-	int bar_w = (int)CAMERA_W;
-	int bar_h = 4;
-	for (int y = bar_y; y < bar_y + bar_h && y < (int)DISPLAY_H; y++) {
-		for (int x = FRAME_X_OFFSET; x < FRAME_X_OFFSET + bar_w; x++) {
-			set_display_pixel_rgb565(dst, (uint16_t)x, (uint16_t)y, bar_color);
+	/* Draw a colored border around the live 160x120 camera image:
+	 * top, bottom, left, and right edges. Make it a few pixels thick
+	 * so it is easy to see.
+	 */
+	int x0 = FRAME_X_OFFSET;
+	int y0 = FRAME_Y_OFFSET;
+	int x1 = FRAME_X_OFFSET + CAMERA_W - 1;
+	int y1 = FRAME_Y_OFFSET + CAMERA_H - 1;
+
+	if (x0 < 0) x0 = 0;
+	if (y0 < 0) y0 = 0;
+	if (x1 >= DISPLAY_W) x1 = DISPLAY_W - 1;
+	if (y1 >= DISPLAY_H) y1 = DISPLAY_H - 1;
+
+	const int border_thickness = 3;
+
+	/* Vertical edges (left/right), thicker by a few pixels. */
+	for (int t = 0; t < border_thickness; t++) {
+		int lx = x0 + t;
+		int rx = x1 - t;
+		if (lx > x1 || rx < x0) {
+			break;
+		}
+		for (int y = y0; y <= y1; y++) {
+			set_display_pixel_rgb565(dst, (uint16_t)lx, (uint16_t)y, bar_color);
+			set_display_pixel_rgb565(dst, (uint16_t)rx, (uint16_t)y, bar_color);
 		}
 	}
+
+	/* Horizontal edges (top/bottom), thicker by a few pixels. */
+	for (int t = 0; t < border_thickness; t++) {
+		int ty = y0 + t;
+		int by = y1 - t;
+		if (ty > y1 || by < y0) {
+			break;
+		}
+		for (int x = x0; x <= x1; x++) {
+			set_display_pixel_rgb565(dst, (uint16_t)x, (uint16_t)ty, bar_color);
+			set_display_pixel_rgb565(dst, (uint16_t)x, (uint16_t)by, bar_color);
+		}
+	}
+
 	/* Person score percentage always in yellow */
 	char buf[8];
 	snprintf(buf, sizeof(buf), "%d%%", person_pct);
-	draw_string_on_rgb565(dst, (uint16_t)FRAME_X_OFFSET, (uint16_t)(bar_h + 2),
+	/* Place text well above the top border so it does not overlap
+	 * the live image or affect its appearance.
+	 */
+	int text_y = FRAME_Y_OFFSET - (FONT_H + 4);
+	if (text_y < 0) {
+		text_y = 0;
+	}
+	draw_string_on_rgb565(dst, (uint16_t)FRAME_X_OFFSET + 5, (uint16_t)text_y + 10,
 			      buf, COLOR_YELLOW);
 	(void)no_person_score;
 }
@@ -581,11 +684,40 @@ static void copy_frame_to_display(const uint8_t *src, uint8_t *dst,
 		borders_cleared = 1;
 	}
 
-	for (int y = 0; y < CAMERA_H; y++) {
-		const uint16_t *src_row = s + y * CAMERA_W;
-		uint16_t *dst_row = d + (FRAME_Y_OFFSET + y) * DISPLAY_W + FRAME_X_OFFSET;
+	if (!is_zoom_2x) {
+		/* 1x: direct 160x120 copy into centered window */
+		for (int y = 0; y < CAMERA_H; y++) {
+			const uint16_t *src_row = s + y * CAMERA_W;
+			uint16_t *dst_row = d + (FRAME_Y_OFFSET + y) * DISPLAY_W + FRAME_X_OFFSET;
 
-		memcpy(dst_row, src_row, CAMERA_W * sizeof(uint16_t));
+			memcpy(dst_row, src_row, CAMERA_W * sizeof(uint16_t));
+		}
+	} else {
+		/* 2x digital zoom in software:
+		 * take the central 80x60 region of the 160x120 frame and
+		 * scale it up 2x2 to fill 160x120.
+		 *
+		 * Source window:
+		 *   src_w = CAMERA_W / 2 = 80
+		 *   src_h = CAMERA_H / 2 = 60
+		 *   src_x0 = (CAMERA_W - src_w) / 2 = 40
+		 *   src_y0 = (CAMERA_H - src_h) / 2 = 30
+		 */
+		const int src_w = CAMERA_W / 2;
+		const int src_h = CAMERA_H / 2;
+		const int src_x0 = (CAMERA_W - src_w) / 2;
+		const int src_y0 = (CAMERA_H - src_h) / 2;
+
+		for (int y = 0; y < CAMERA_H; y++) {
+			int src_y = src_y0 + (y / 2);
+			const uint16_t *src_row = s + src_y * CAMERA_W;
+			uint16_t *dst_row = d + (FRAME_Y_OFFSET + y) * DISPLAY_W + FRAME_X_OFFSET;
+
+			for (int x = 0; x < CAMERA_W; x++) {
+				int src_x = src_x0 + (x / 2);
+				dst_row[x] = src_row[src_x];
+			}
+		}
 	}
 
 	draw_person_overlay(dst, person_score, no_person_score);
@@ -1110,6 +1242,10 @@ int main(void)
 		LOG_ERR("> Failed to set VFLIP");
 	}
 
+	/* Enable ISP scaler and apply default 1x zoom window before capture starts. */
+	ov5640_enable_scaler();
+	ov5640_set_zoom_1x();
+
 	LOG_INF("Camera configured: RGB565 %ux%u (hflip=%d vflip=%d)\n", CAMERA_W, CAMERA_H,
 		want_hflip, want_vflip);
 
@@ -1136,9 +1272,47 @@ static void inference_thread(void)
 			continue;
 		}
 
-		/* Copy latest frame under mutex to avoid tearing while camera writes. */
+		/* Build inference frame under mutex to keep a consistent view. */
 		k_mutex_lock(&latest_frame_mutex, K_FOREVER);
-		memcpy(inference_frame, latest_frame, sizeof(inference_frame));
+		if (!is_zoom_2x) {
+			/* 1x: direct copy of 160x120 frame */
+			memcpy(inference_frame, latest_frame, sizeof(inference_frame));
+		} else {
+			/* 2x: build a 160x120 frame where the central 80x60 region
+			 * is the zoomed ROI (1:1 pixels), and the rest is padded.
+			 * TFLM will then center-crop 96x96 from this, so the 80x60
+			 * content appears centered with padding around it.
+			 */
+			const uint16_t *src = (const uint16_t *)latest_frame;
+			uint16_t *dst = (uint16_t *)inference_frame;
+			const int src_w = CAMERA_W / 2;   /* 80 */
+			const int src_h = CAMERA_H / 2;   /* 60 */
+			const int src_x0 = (CAMERA_W - src_w) / 2;  /* 40 */
+			const int src_y0 = (CAMERA_H - src_h) / 2;  /* 30 */
+
+			/* Clear entire frame to black (padding). */
+			memset(dst, 0x00, CAMERA_W * CAMERA_H * sizeof(uint16_t));
+
+			/* Place 80x60 ROI centered within the 96x96 NN crop area.
+			 * NN crop: x in [32, 127], y in [12, 107]
+			 * We want ROI (80x60) centered there:
+			 *   pad_x = (96 - 80)/2 = 8, pad_y = (96 - 60)/2 = 18
+			 *   dest_x0 = 32 + 8 = 40, dest_y0 = 12 + 18 = 30
+			 */
+			const int dest_x0 = 40;
+			const int dest_y0 = 30;
+
+			for (int ry = 0; ry < src_h; ry++) {
+				int sy = src_y0 + ry;
+				const uint16_t *src_row = src + sy * CAMERA_W;
+				uint16_t *dst_row = dst + (dest_y0 + ry) * CAMERA_W;
+
+				for (int rx = 0; rx < src_w; rx++) {
+					int sx = src_x0 + rx;
+					dst_row[dest_x0 + rx] = src_row[sx];
+				}
+			}
+		}
 		k_mutex_unlock(&latest_frame_mutex);
 
 		int8_t person_score = 0;
@@ -1152,7 +1326,7 @@ static void inference_thread(void)
 		}
 
 		/* Small delay between inferences; main cost is the model itself. */
-		k_msleep(500);
+		// k_msleep(50);
 	}
 }
 
@@ -1160,9 +1334,9 @@ K_THREAD_DEFINE(inference_id, INFERENCE_STACKSIZE, inference_thread, NULL, NULL,
 		PRIORITY_CAMERA, 0, 0);
 K_THREAD_DEFINE(display_id, DEFAULT_STACKSIZE, display_thread, NULL, NULL, NULL,
 		PRIORITY_CAMERA, 0, 0);
-K_THREAD_DEFINE(blink0_id, DEFAULT_STACKSIZE, blink0, NULL, NULL, NULL,
-		PRIORITY_LED, 0, 0);
-K_THREAD_DEFINE(blink1_id, DEFAULT_STACKSIZE, blink1, NULL, NULL, NULL,
-		PRIORITY_LED, 0, 0);
+// K_THREAD_DEFINE(blink0_id, DEFAULT_STACKSIZE, blink0, NULL, NULL, NULL,
+// 		PRIORITY_LED, 0, 0);
+// K_THREAD_DEFINE(blink1_id, DEFAULT_STACKSIZE, blink1, NULL, NULL, NULL,
+// 		PRIORITY_LED, 0, 0);
 K_THREAD_DEFINE(camera_id, CAMERA_STACKSIZE, camera_thread, NULL, NULL, NULL,
 		PRIORITY_CAMERA, 0, 0);
