@@ -1,6 +1,0 @@
-# Copyright (c) 2021 STMicroelectronics
-# SPDX-License-Identifier: Apache-2.0
-
-config BOARD_EDGEAIPROTO
-    select SOC_STM32U585XX
-    
