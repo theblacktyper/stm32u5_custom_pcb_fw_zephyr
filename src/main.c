@@ -10,7 +10,7 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(kk_edge_ai, LOG_LEVEL_INF);
 
-#include "main_functions.h"  /* TFLM: overlay get/ready (draw); setup/fill (inference thread) */
+#include "main_functions.h"  /* TFLM person detection: setup (inference thread), run (camera thread) */
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/display.h>
@@ -22,13 +22,14 @@ LOG_MODULE_REGISTER(kk_edge_ai, LOG_LEVEL_INF);
 #include <zephyr/devicetree.h>
 #include <version.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* size of stack area used by threads */
 #define DEFAULT_STACKSIZE    1024
 #define INFERENCE_STACKSIZE  2048
-#define CAMERA_STACKSIZE     4096
+#define CAMERA_STACKSIZE     8192
 
 /* scheduling priority: lower number = higher priority in Zephyr */
 #define EQUAL_PRIORITY    7
@@ -47,17 +48,27 @@ LOG_MODULE_REGISTER(kk_edge_ai, LOG_LEVEL_INF);
 #endif
 
 #define SW0_NODE DT_ALIAS(sw0)
+#define SW1_NODE DT_ALIAS(sw1)
 
 #if !DT_NODE_HAS_STATUS_OKAY(SW0_NODE)
 #error "Unsupported board: sw0 devicetree alias is not defined"
 #endif
 
-/* Configure button (sw0) as capture trigger */
+#if !DT_NODE_HAS_STATUS_OKAY(SW1_NODE)
+#error "Unsupported board: sw1 devicetree alias is not defined"
+#endif
+
+/* Configure button as capture trigger */
+// sw0
 const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(SW0_NODE, gpios);
+// sw1
+const struct gpio_dt_spec button_sec = GPIO_DT_SPEC_GET(SW1_NODE, gpios);
 
 /* CAMERA: sensor for readiness check, DCMI controller for all video API ops */
 const struct device *ov5640 = DEVICE_DT_GET(DT_NODELABEL(ov5640));
 const struct device *video_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_camera));
+
+static volatile uint8_t is_cam_capture_started = 0;
 
 /*
  * STM32U5 GPDMA block-transfer limit is 65 535 bytes (16-bit BNDT register).
@@ -89,6 +100,13 @@ static int64_t fps_start_ms;
 static float fps_current;
 static float fps_last_logged = -1.0f;
 
+/* Shared frame and scores between camera and inference threads */
+static uint8_t latest_frame[CAMERA_W * CAMERA_H * sizeof(uint16_t)];
+K_MUTEX_DEFINE(latest_frame_mutex);
+static atomic_t latest_frame_valid = ATOMIC_INIT(0);
+static int8_t latest_person_score;
+static int8_t latest_no_person_score;
+
 struct led {
 	struct gpio_dt_spec spec;
 	uint8_t num;
@@ -105,6 +123,31 @@ static const struct led led1 = {
 };
 
 static struct gpio_callback button_cb_data;
+static struct gpio_callback button_sec_cb_data;
+
+/* Button(s) callback */
+// Button 2 (sw0)
+static void button_pressed_cb(const struct device *dev,
+			      struct gpio_callback *cb,
+			      uint32_t pins)
+{
+	if (!is_cam_capture_started)
+		k_sem_give(&capture_sem);
+	else
+	{
+		/* Implement Zoom - */
+	}
+}
+// Button 1 (sw1)
+static void button_sec_pressed_cb(const struct device *dev,
+			      struct gpio_callback *cb,
+			      uint32_t pins)
+{
+	if (is_cam_capture_started)
+	{
+		/* Implement Zoom + */
+	}
+}
 
 /* ---- 8x16 bitmap font for printable ASCII 0x20-0x7E (VGA style) -------- */
 #define FONT_W  8
@@ -428,14 +471,6 @@ static void display_text(const struct device *dev,
 	display_write(dev, x_pos, y_pos, &desc, text_buf);
 }
 
-/* Button 2 (sw0) */
-static void button_pressed_cb(const struct device *dev,
-			      struct gpio_callback *cb,
-			      uint32_t pins)
-{
-	k_sem_give(&capture_sem);
-}
-
 /* ---- Camera ---------------------------------------------------- */
 /*
  * Set one pixel in the display buffer (RGB565, DISPLAY_W x DISPLAY_H).
@@ -462,83 +497,78 @@ static void set_display_pixel_rgb565(uint8_t *dst, uint16_t dx, uint16_t dy,
 }
 
 /*
- * Draw a line segment in the display buffer (RGB565) using Bresenham.
+ * Draw a string into the RGB565 display buffer at (x0, y0), 8x16 pixels per character.
  */
-static void draw_line_rgb565(uint8_t *dst, int x0, int y0, int x1, int y1,
-			     uint32_t color)
+static void draw_string_on_rgb565(uint8_t *dst, uint16_t x0, uint16_t y0,
+				  const char *str, uint32_t color)
 {
-	int dx = x1 - x0;
-	int dy = y1 - y0;
-	int ax = (dx < 0) ? -dx : dx;
-	int ay = (dy < 0) ? -dy : dy;
-	int steps = (ax > ay) ? ax : ay;
-	if (steps <= 0) {
-		set_display_pixel_rgb565(dst, (uint16_t)x0, (uint16_t)y0, color);
-		return;
-	}
-	for (int i = 0; i <= steps; i++) {
-		int t = (steps == 0) ? 0 : (i * 65536 / steps);
-		int x = x0 + (dx * t) / 65536;
-		int y = y0 + (dy * t) / 65536;
-		set_display_pixel_rgb565(dst, (uint16_t)x, (uint16_t)y, color);
+	for (int c = 0; str[c] != '\0'; c++) {
+		const uint8_t *glyph = glyph_for_char(str[c]);
+		if (!glyph) {
+			continue;
+		}
+		for (int row = 0; row < FONT_H; row++) {
+			uint8_t bits = glyph[row];
+			for (int col = 0; col < FONT_W; col++) {
+				if (bits & (0x80U >> col)) {
+					uint16_t px = (uint16_t)(x0 + c * FONT_W + col);
+					uint16_t py = (uint16_t)(y0 + row);
+					if (px < DISPLAY_W && py < DISPLAY_H) {
+						set_display_pixel_rgb565(dst, px, py, color);
+					}
+				}
+			}
+		}
 	}
 }
 
 /*
- * Draw sine overlay from precomputed buffer (filled by inference thread).
- * No TFLM inference in this thread; read-only for person-detection-ready design.
+ * Draw person detection overlay: bar at top (green if person >= 50%, else red) + person % in yellow.
+ * Int8 softmax: scale 1/256, zero_point -128 -> percentage = (val + 128) * 100 / 256.
  */
-static void draw_sine_overlay(uint8_t *dst)
+static int clamp_pct(int val)
 {
-	const int center_y = FRAME_Y_OFFSET + CAMERA_H / 2;
-	const int amplitude = (CAMERA_H / 2) - 4;
-	if (amplitude <= 0) {
-		return;
+	if (val < 0) {
+		return 0;
 	}
-	if (!tflm_sine_overlay_is_ready()) {
-		return;
+	if (val > 100) {
+		return 100;
 	}
+	return val;
+}
 
-	const float *y_values;
-	int num_points;
-	tflm_sine_overlay_get(&y_values, &num_points);
-	if (num_points <= 0) {
-		return;
+static void draw_person_overlay(uint8_t *dst, int8_t person_score, int8_t no_person_score)
+{
+	/* Person score as percentage (person class only) */
+	int person_pct = clamp_pct((int)(person_score + 128) * 100 / 256);
+	/* Bar: green when person >= 50%, otherwise red */
+	int person_at_least_half = (person_pct >= 50);
+	uint16_t bar_color = person_at_least_half ? COLOR_GREEN : COLOR_RED;
+
+	/* Draw bar at the very top (y = 0), 160px wide centered */
+	int bar_y = 0;
+	int bar_w = (int)CAMERA_W;
+	int bar_h = 4;
+	for (int y = bar_y; y < bar_y + bar_h && y < (int)DISPLAY_H; y++) {
+		for (int x = FRAME_X_OFFSET; x < FRAME_X_OFFSET + bar_w; x++) {
+			set_display_pixel_rgb565(dst, (uint16_t)x, (uint16_t)y, bar_color);
+		}
 	}
-
-	int prev_px = -1;
-	int prev_py = -1;
-	for (int i = 0; i < num_points; i++) {
-		float y = y_values[i];
-		int px = FRAME_X_OFFSET + (int)((float)i * (float)(CAMERA_W - 1) /
-						(float)(num_points > 1 ? num_points - 1 : 1));
-		if (px >= FRAME_X_OFFSET + (int)CAMERA_W) {
-			px = FRAME_X_OFFSET + CAMERA_W - 1;
-		}
-		int py = center_y - (int)(y * (float)amplitude);
-
-		if (py < (int)FRAME_Y_OFFSET) {
-			py = FRAME_Y_OFFSET;
-		}
-		if (py >= FRAME_Y_OFFSET + (int)CAMERA_H) {
-			py = FRAME_Y_OFFSET + CAMERA_H - 1;
-		}
-
-		set_display_pixel_rgb565(dst, (uint16_t)px, (uint16_t)py, COLOR_GREEN);
-		if (prev_px >= 0) {
-			draw_line_rgb565(dst, prev_px, prev_py, px, py, COLOR_GREEN);
-		}
-		prev_px = px;
-		prev_py = py;
-	}
+	/* Person score percentage always in yellow */
+	char buf[8];
+	snprintf(buf, sizeof(buf), "%d%%", person_pct);
+	draw_string_on_rgb565(dst, (uint16_t)FRAME_X_OFFSET, (uint16_t)(bar_h + 2),
+			      buf, COLOR_YELLOW);
+	(void)no_person_score;
 }
 
 /**
  * Copy 160x120 frame 1:1 (no scaling), centred on 240x135 display.
  * Black borders fill the margins.
- * Then draw the Zephyr hello_world-style sine wave overlay on the frame.
+ * Draw person detection overlay (bar + optional label) using given scores.
  */
-static void copy_frame_to_display(const uint8_t *src, uint8_t *dst)
+static void copy_frame_to_display(const uint8_t *src, uint8_t *dst,
+				  int8_t person_score, int8_t no_person_score)
 {
 	/* One-time clear of borders; camera region is fully overwritten each frame. */
 	static int borders_cleared;
@@ -558,32 +588,12 @@ static void copy_frame_to_display(const uint8_t *src, uint8_t *dst)
 		memcpy(dst_row, src_row, CAMERA_W * sizeof(uint16_t));
 	}
 
-	draw_sine_overlay(dst);
+	draw_person_overlay(dst, person_score, no_person_score);
 }
 
 void camera_thread(void)
 {
 	int ret;
-
-	if (!gpio_is_ready_dt(&button)) {
-		LOG_ERR("Button device not ready");
-		return;
-	}
-
-	ret = gpio_pin_configure_dt(&button, GPIO_INPUT);
-	if (ret < 0) {
-		LOG_ERR("Failed to configure button: %d", ret);
-		return;
-	}
-
-	ret = gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
-	if (ret < 0) {
-		LOG_ERR("Failed to configure button interrupt: %d", ret);
-		return;
-	}
-
-	gpio_init_callback(&button_cb_data, button_pressed_cb, BIT(button.pin));
-	gpio_add_callback(button.port, &button_cb_data);
 
     LOG_INF("===== Camera Config Info =====");
 
@@ -635,7 +645,7 @@ void camera_thread(void)
 
 	/* Wait for SW0 press before starting capture; then run until power cycle */
 	k_sem_take(&capture_sem, K_FOREVER);
-
+    if (!is_cam_capture_started) is_cam_capture_started = 1;
 	LOG_INF("Capture started");
 
 	/* Enqueue all buffers before starting */
@@ -683,7 +693,16 @@ void camera_thread(void)
 
 		video_stream_stop(video_dev, VIDEO_BUF_TYPE_OUTPUT);
 
-		copy_frame_to_display(vbuf->buffer, disp_buf);
+		/* Publish latest frame for inference thread (non-blocking copy). */
+		k_mutex_lock(&latest_frame_mutex, K_FOREVER);
+		memcpy(latest_frame, vbuf->buffer, frame_size);
+		atomic_set(&latest_frame_valid, 1);
+		k_mutex_unlock(&latest_frame_mutex);
+
+		/* Use latest known scores from inference thread for overlay. */
+		int8_t person_score = latest_person_score;
+		int8_t no_person_score = latest_no_person_score;
+		copy_frame_to_display(vbuf->buffer, disp_buf, person_score, no_person_score);
 
 		atomic_set(&show_camera_frame, 1);
 
@@ -957,6 +976,53 @@ void blink1(void)
 	blink(&led1, 125, 1);
 }
 
+static void init_usr_buttons(void)
+{
+	int ret;
+
+	/* Main Button (button 2) */
+	if (!gpio_is_ready_dt(&button)) {
+		LOG_ERR("Button 2 device not ready");
+		return;
+	}
+
+	ret = gpio_pin_configure_dt(&button, GPIO_INPUT);
+	if (ret < 0) {
+		LOG_ERR("Failed to configure button 2: %d", ret);
+		return;
+	}
+
+	ret = gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
+	if (ret < 0) {
+		LOG_ERR("Failed to configure button 2 interrupt: %d", ret);
+		return;
+	}
+
+	gpio_init_callback(&button_cb_data, button_pressed_cb, BIT(button.pin));
+	gpio_add_callback(button.port, &button_cb_data);
+
+	/* Secondary Button (button 1) */
+	if (!gpio_is_ready_dt(&button_sec)) {
+		LOG_ERR("Button 1 device not ready");
+		return;
+	}
+
+	ret = gpio_pin_configure_dt(&button_sec, GPIO_INPUT);
+	if (ret < 0) {
+		LOG_ERR("Failed to configure button 1: %d", ret);
+		return;
+	}
+
+	ret = gpio_pin_interrupt_configure_dt(&button_sec, GPIO_INT_EDGE_TO_ACTIVE);
+	if (ret < 0) {
+		LOG_ERR("Failed to configure button 1 interrupt: %d", ret);
+		return;
+	}
+
+	gpio_init_callback(&button_sec_cb_data, button_sec_pressed_cb, BIT(button_sec.pin));
+	gpio_add_callback(button_sec.port, &button_sec_cb_data);
+}
+
 int main(void)
 {
 	LOG_INF("===== System Information =====");
@@ -966,6 +1032,8 @@ int main(void)
 	LOG_INF("Kernel ticks/sec: %u", CONFIG_SYS_CLOCK_TICKS_PER_SEC);
 	LOG_INF("Build: " __DATE__ " " __TIME__);
 	LOG_INF("==============================\n");
+
+	init_usr_buttons();
 
 	/* Init camera sensor + video capture (DCMI) device */
 	if (!device_is_ready(ov5640)) {
@@ -1053,15 +1121,39 @@ int main(void)
 	return 0;
 }
 
-/* Dedicated inference thread: runs TFLM once to fill overlay buffer, then exits. */
+/* Dedicated inference thread: runs TFLM person detection on latest frame periodically. */
 static void inference_thread(void)
 {
-	tflm_sine_setup();
-	// while (1)
-	// {
-		tflm_sine_fill_overlay_buffer();
-	// 	k_msleep(1000);
-	// }
+	static uint8_t inference_frame[CAMERA_W * CAMERA_H * sizeof(uint16_t)];
+
+	tflm_person_detection_setup();
+
+	while (1) {
+		/* Wait until TFLM is ready and we have at least one frame. */
+		if (!tflm_person_detection_ready() ||
+		    !atomic_get(&latest_frame_valid)) {
+			k_msleep(100);
+			continue;
+		}
+
+		/* Copy latest frame under mutex to avoid tearing while camera writes. */
+		k_mutex_lock(&latest_frame_mutex, K_FOREVER);
+		memcpy(inference_frame, latest_frame, sizeof(inference_frame));
+		k_mutex_unlock(&latest_frame_mutex);
+
+		int8_t person_score = 0;
+		int8_t no_person_score = 0;
+
+		int rc = tflm_person_detection_run(inference_frame, &person_score, &no_person_score);
+
+		if (rc == 0) {
+			latest_person_score = person_score;
+			latest_no_person_score = no_person_score;
+		}
+
+		/* Small delay between inferences; main cost is the model itself. */
+		k_msleep(500);
+	}
 }
 
 K_THREAD_DEFINE(inference_id, INFERENCE_STACKSIZE, inference_thread, NULL, NULL, NULL,

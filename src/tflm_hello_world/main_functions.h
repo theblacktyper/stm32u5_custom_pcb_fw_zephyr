@@ -1,36 +1,30 @@
 /*
- * Copyright 2020 The TensorFlow Authors. All Rights Reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Person detection TFLM API.
+ * Run inference on 160x120 RGB565 frames; model uses 96x96 grayscale center crop.
  */
 
-#ifndef TENSORFLOW_LITE_MICRO_EXAMPLES_HELLO_WORLD_MAIN_FUNCTIONS_H_
-#define TENSORFLOW_LITE_MICRO_EXAMPLES_HELLO_WORLD_MAIN_FUNCTIONS_H_
+#ifndef MAIN_FUNCTIONS_H_
+#define MAIN_FUNCTIONS_H_
+
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* One-time setup: load model and allocate interpreter. Call before fill or predict. */
-void tflm_sine_setup(void);
+/* One-time setup: load model and allocate interpreter. Call before run. */
+void tflm_person_detection_setup(void);
 
-/* Run inference for input x in [0, kXrange] (0..2*pi). Returns predicted y (sine). */
-float tflm_sine_predict(float x);
+/* Run inference on a 160x120 RGB565 frame. Fills out_* with int8 scores. Returns 0 on success. */
+int tflm_person_detection_run(const uint8_t *frame_rgb565_160x120,
+			      int8_t *out_person_score,
+			      int8_t *out_no_person_score);
 
-/* Fill the overlay buffer with model outputs (call from inference thread only). */
-void tflm_sine_fill_overlay_buffer(void);
-
-/* Get precomputed y values for overlay drawing. *out_num_points is set to valid count. */
-void tflm_sine_overlay_get(const float **out_y_values, int *out_num_points);
-
-/* True after tflm_sine_fill_overlay_buffer() has completed (safe to read from overlay). */
-int tflm_sine_overlay_is_ready(void);
+/* True after setup succeeded. */
+int tflm_person_detection_ready(void);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* TENSORFLOW_LITE_MICRO_EXAMPLES_HELLO_WORLD_MAIN_FUNCTIONS_H_ */
+#endif /* MAIN_FUNCTIONS_H_ */

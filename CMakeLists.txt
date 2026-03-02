@@ -10,8 +10,8 @@ project(kk_edge_ai_tflm_hello)
 
 target_sources(app PRIVATE src/main.c)
 target_sources(app PRIVATE
-  src/tflm_hello_world/constants.c
-  src/tflm_hello_world/model.cpp
+  src/tflm_hello_world/model_settings.c
+  src/tflm_hello_world/person_detect_model_data.c
   src/tflm_hello_world/main_functions.cpp
   src/tflm_hello_world/output_handler.cpp
   src/tflm_hello_world/assert.cpp

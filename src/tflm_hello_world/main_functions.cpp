@@ -1,26 +1,18 @@
 /*
- * Copyright 2020 The TensorFlow Authors. All Rights Reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Person detection TFLM integration.
+ * Input: 96x96 grayscale int8 (from 160x120 RGB565 center crop).
+ * Output: 2 classes (not person, person); int8 scores.
  */
 
 #include "main_functions.h"
-#include "constants.h"
-#include "model.hpp"
-#include "output_handler.hpp"
-#include <cmath>
-#include <cstdlib>
+#include "model_settings.h"
+#include "person_detect_model_data.hpp"
 
-#include <zephyr/sys/atomic.h>
-
+#include <cstring>
 #include "tensorflow/lite/micro/micro_log.h"
-#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
-#include "tensorflow/lite/core/api/flatbuffer_conversions.h"
 
 namespace {
 
@@ -29,33 +21,32 @@ tflite::MicroInterpreter *interpreter = nullptr;
 TfLiteTensor *input = nullptr;
 TfLiteTensor *output = nullptr;
 
-constexpr int kTensorArenaSize = 2000;
+constexpr int kTensorArenaSize = 136 * 1024;
 alignas(16) uint8_t tensor_arena[kTensorArenaSize];
 
 bool setup_done = false;
 
-/* Precomputed overlay: filled by inference thread, read by display. */
-float s_y_values[TFLM_SINE_OVERLAY_MAX_POINTS];
-int s_num_points = 0;
-atomic_t s_overlay_ready = ATOMIC_INIT(0);
+}  // namespace
 
-}  /* namespace */
-
-void tflm_sine_setup(void)
+void tflm_person_detection_setup(void)
 {
 	if (setup_done) {
 		return;
 	}
 
-	model = tflite::GetModel(g_model);
+	model = tflite::GetModel(g_person_detect_model_data);
 	if (model->version() != TFLITE_SCHEMA_VERSION) {
 		MicroPrintf("Model schema version %d not supported (need %d)",
 			    model->version(), TFLITE_SCHEMA_VERSION);
 		return;
 	}
 
-	static tflite::MicroMutableOpResolver<1> resolver;
-	resolver.AddFullyConnected();
+	static tflite::MicroMutableOpResolver<5> resolver;
+	resolver.AddAveragePool2D(tflite::Register_AVERAGE_POOL_2D_INT8());
+	resolver.AddConv2D(tflite::Register_CONV_2D_INT8());
+	resolver.AddDepthwiseConv2D(tflite::Register_DEPTHWISE_CONV_2D_INT8());
+	resolver.AddReshape();
+	resolver.AddSoftmax(tflite::Register_SOFTMAX_INT8());
 
 	static tflite::MicroInterpreter static_interpreter(
 		model, resolver, tensor_arena, kTensorArenaSize);
@@ -71,47 +62,52 @@ void tflm_sine_setup(void)
 	setup_done = true;
 }
 
-float tflm_sine_predict(float x)
+/*
+ * Convert 160x120 RGB565 frame to 96x96 grayscale int8 (center crop).
+ * Model expects signed int8; subtract 128 from grayscale [0,255].
+ */
+static void rgb565_160x120_to_96x96_grayscale_int8(const uint16_t *rgb565,
+						   int8_t *out_grayscale)
+{
+	const int crop_x = (160 - kNumCols) / 2;
+	const int crop_y = (120 - kNumRows) / 2;
+
+	for (int dy = 0; dy < kNumRows; dy++) {
+		for (int dx = 0; dx < kNumCols; dx++) {
+			int sx = crop_x + dx;
+			int sy = crop_y + dy;
+			uint16_t px = rgb565[sy * 160 + sx];
+			/* RGB565: R=bits 11-15, G=5-10, B=0-4. Approximate grayscale. */
+			uint8_t r = (uint8_t)((px >> 11) * 255 / 31);
+			uint8_t g = (uint8_t)(((px >> 5) & 0x3f) * 255 / 63);
+			uint8_t b = (uint8_t)((px & 0x1f) * 255 / 31);
+			uint8_t gray = (uint8_t)((r * 77 + g * 150 + b * 29) >> 8);
+			*out_grayscale++ = (int8_t)((int)gray - 128);
+		}
+	}
+}
+
+int tflm_person_detection_run(const uint8_t *frame_rgb565_160x120,
+			      int8_t *out_person_score,
+			      int8_t *out_no_person_score)
 {
 	if (!setup_done || input == nullptr || output == nullptr) {
-		return 0.0f;
+		return -1;
 	}
 
-	int8_t x_quantized = static_cast<int8_t>(
-		std::round(x / input->params.scale) + input->params.zero_point);
-	input->data.int8[0] = x_quantized;
+	const uint16_t *rgb565 = (const uint16_t *)frame_rgb565_160x120;
+	rgb565_160x120_to_96x96_grayscale_int8(rgb565, input->data.int8);
 
 	if (interpreter->Invoke() != kTfLiteOk) {
-		return 0.0f;
+		return -1;
 	}
 
-	int8_t y_quantized = output->data.int8[0];
-	float y = (y_quantized - output->params.zero_point) * output->params.scale;
-	return y;
+	*out_no_person_score = output->data.int8[kNotAPersonIndex];
+	*out_person_score = output->data.int8[kPersonIndex];
+	return 0;
 }
 
-void tflm_sine_fill_overlay_buffer(void)
+int tflm_person_detection_ready(void)
 {
-	tflm_sine_setup();
-	if (!setup_done) {
-		return;
-	}
-	const int n = TFLM_SINE_OVERLAY_MAX_POINTS;
-	for (int i = 0; i < n; i++) {
-		float x = (float)i / (float)(n - 1) * kXrange;
-		s_y_values[i] = tflm_sine_predict(x);
-	}
-	s_num_points = n;
-	atomic_set(&s_overlay_ready, 1);
-}
-
-void tflm_sine_overlay_get(const float **out_y_values, int *out_num_points)
-{
-	*out_y_values = s_y_values;
-	*out_num_points = s_num_points;
-}
-
-int tflm_sine_overlay_is_ready(void)
-{
-	return atomic_get(&s_overlay_ready) != 0;
+	return setup_done ? 1 : 0;
 }
