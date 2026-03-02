@@ -1,0 +1,240 @@
+#include <zephyr/dt-bindings/video/video-interfaces.h>
+
+/ {
+    chosen {
+		zephyr,display = &st7789v;
+		zephyr,camera = &dcmi;
+	};
+
+	/*
+	 * MikroElektronika IPS Display Click (MIKROE-6077) overlay
+	 * for custom STM32U585RI board, plugged into mikroBUS Socket 2 (J2).
+	 *
+	 * Click board: ER-TFT1.14-2, ST7789V controller, 135x240, SPI
+	 *
+	 * IPS Display Click mikroBUS pin usage:
+	 *   CS   → mikroBUS pin 3  (CS)   → SPI1_CS  → PA15   (pin 50)
+	 *   SCK  → mikroBUS pin 4  (SCK)  → SPI1_SCK → PB3
+	 *   MOSI → mikroBUS pin 6  (MOSI) → SPI1_MOSI→ PA12
+	 *   RST  → mikroBUS pin 2  (RST)  → CLICK_2_RST → PB12 (pin 33)
+	 *   RS   → mikroBUS pin 15 (INT)  → CLICK_2_INT → PB0  (pin 26)
+	 *         (RS = Data/Command selection pin on IPS Display Click)
+	 *
+	 * NOTE: The IPS Display Click routes the RS (D/C) pin to the
+	 * INT position on mikroBUS. The backlight is always on (no BCK pin).
+	 * The AN pin is used by the ClickID feature.
+	 *
+	 * Since Zephyr v3.7+, ST7789V uses the MIPI DBI driver class.
+	 * The display node must live inside a zephyr,mipi-dbi-spi wrapper.
+	 * - cmd-data-gpios is now dc-gpios on the mipi_dbi node
+	 * - Polarity changed to GPIO_ACTIVE_HIGH for dc-gpios
+	 * - spi-max-frequency is now mipi-max-frequency on the display node
+	 * - reset-gpios moves to the mipi_dbi node
+	 */
+
+	mipi_dbi {
+		compatible = "zephyr,mipi-dbi-spi";
+		status = "okay";
+		spi-dev = <&spi1>;
+		dc-gpios = <&gpiob 0 GPIO_ACTIVE_HIGH>;     /* RS / D/C = PB0 */
+		reset-gpios = <&gpiob 12 GPIO_ACTIVE_LOW>;   /* RST = PB12 */
+		write-only;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		st7789v: st7789v@0 {
+			compatible = "sitronix,st7789v";
+			status = "okay";
+			reg = <0>;
+			mipi-max-frequency = <20000000>;
+			mipi-mode = "MIPI_DBI_MODE_SPI_4WIRE";
+
+			width  = <240>;
+			height = <135>;
+			x-offset = <40>;   /* for default rotation: 0x40 */
+			y-offset = <52>;   /* for default rotation: 0x53 */
+
+			vcom  = <0x19>;
+			gctrl = <0x35>;
+			vrhs  = <0x12>;
+			vdvs  = <0x20>;
+			mdac  = <0xB0>;    /* for default rotation: 0x70 */
+			gamma = <0x01>;
+			colmod = <0x55>;
+			lcm   = <0x2c>;
+			ready-time-ms = <15>;
+			porch-param    = [0c 0c 00 33 33];
+			cmd2en-param   = [5a 69 02 01];
+			pwctrl1-param  = [a4 a1];
+			pvgam-param    = [D0 04 0D 11 13 2B 3F 54 4C 18 0D 0B 1F 23];
+			nvgam-param    = [D0 04 0C 11 13 2C 3F 44 51 2F 1F 1F 20 23];
+			ram-param      = [00 F0];
+			rgb-param      = [CD 08 14];
+		};
+	};
+
+	soc {
+		/*
+		 * DCMI — defined from scratch (not in STM32U585 DTSI yet)
+		 *
+		 * Key STM32U585-specific values (from RM0456 + CMSIS headers):
+		 *   Base address : 0x4202C000  (AHB2, Table 7 of RM0456)
+		 *   IRQ number   : 119         (DCMI_PSSI_IRQn, STM32U585 vector table)
+		 *   Clock        : AHB2 bus, bit 12 (RCC_AHB2ENR1_DCMI_PSSIEN_Pos = 12, mask 0x00001000)
+		 *   DMA          : GPDMA1 ch 12, request slot 86 (LL_GPDMA1_REQUEST_DCMI_PSSI)
+		 *   DMA config   : periph→memory, no-src-inc, dst-inc, word, high-prio = 0x10580
+		 */
+		dcmi: dcmi@4202c000 {
+			compatible = "st,stm32-dcmi";
+			reg = <0x4202c000 0x400>;
+
+			interrupts = <119 0>;
+			interrupt-names = "dcmi";
+
+			/* DCMI_PSSIEN = bit 12 of RCC_AHB2ENR1 (CMSIS: RCC_AHB2ENR1_DCMI_PSSIEN_Pos = 12) */
+			clocks = <&rcc STM32_CLOCK(AHB2, 12U)>;
+
+			/* GPDMA1 ch 12, request slot 86 (DCMI_PSSI),
+			 * config 0x10580: P2M | no-src-inc | dst-inc |
+			 * src-word | dst-word | high-priority            */
+			dmas = <&gpdma1 12 86 0x10580>;
+			dma-names = "dcmi";
+
+			pinctrl-0 = <
+				&dcmi_hsync_pa4
+				&dcmi_pixclk_pa6
+				&dcmi_vsync_pb7
+				&dcmi_d0_pc6
+				&dcmi_d1_pc7
+				&dcmi_d2_pc8
+				&dcmi_d3_pc9
+				&dcmi_d4_pc11
+				&dcmi_d5_pb6
+				&dcmi_d6_pb8
+				&dcmi_d7_pb9
+			>;
+			pinctrl-names = "default";
+			status = "okay";
+
+			port {
+				dcmi_ep_in: endpoint {
+					remote-endpoint-label = "ov5640_ep_out";
+					bus-width = <8>;
+					hsync-active = <0>;
+					vsync-active = <0>;
+					pclk-sample  = <1>;
+				};
+			};
+		};
+	};
+};
+
+&gpdma1 {
+	status = "okay";
+};
+
+&spi1 {
+	status = "okay";
+	pinctrl-0 = <&spi1_sck_pb3 &spi1_mosi_pa12>;
+	pinctrl-names = "default";
+	cs-gpios = <&gpioa 15 GPIO_ACTIVE_LOW>;
+        dmas = <&gpdma1 0 7 0x10440>,
+	       <&gpdma1 1 6 0x10480>;
+	dma-names = "tx", "rx";
+};
+
+&pinctrl {
+	/* DCMI parallel bus pins — AF10 for STM32U585 */
+	dcmi_hsync_pa4: dcmi_hsync_pa4 {
+		pinmux = <STM32_PINMUX('A', 4, AF10)>;
+		bias-disable;
+		slew-rate = "very-high-speed";
+	};
+	dcmi_pixclk_pa6: dcmi_pixclk_pa6 {
+		pinmux = <STM32_PINMUX('A', 6, AF4)>;
+		bias-disable;
+		slew-rate = "very-high-speed";
+	};
+	dcmi_vsync_pb7: dcmi_vsync_pb7 {
+		pinmux = <STM32_PINMUX('B', 7, AF10)>;
+		bias-disable;
+		slew-rate = "very-high-speed";
+	};
+	dcmi_d0_pc6: dcmi_d0_pc6 {
+		pinmux = <STM32_PINMUX('C', 6, AF10)>;
+		bias-disable;
+		slew-rate = "very-high-speed";
+	};
+	dcmi_d1_pc7: dcmi_d1_pc7 {
+		pinmux = <STM32_PINMUX('C', 7, AF10)>;
+		bias-disable;
+		slew-rate = "very-high-speed";
+	};
+	dcmi_d2_pc8: dcmi_d2_pc8 {
+		pinmux = <STM32_PINMUX('C', 8, AF10)>;
+		bias-disable;
+		slew-rate = "very-high-speed";
+	};
+	dcmi_d3_pc9: dcmi_d3_pc9 {
+		pinmux = <STM32_PINMUX('C', 9, AF4)>;
+		bias-disable;
+		slew-rate = "very-high-speed";
+	};
+	dcmi_d4_pc11: dcmi_d4_pc11 {
+		pinmux = <STM32_PINMUX('C', 11, AF10)>;
+		bias-disable;
+		slew-rate = "very-high-speed";
+	};
+	dcmi_d5_pb6: dcmi_d5_pb6 {
+		pinmux = <STM32_PINMUX('B', 6, AF10)>;
+		bias-disable;
+		slew-rate = "very-high-speed";
+	};
+	dcmi_d6_pb8: dcmi_d6_pb8 {
+		pinmux = <STM32_PINMUX('B', 8, AF10)>;
+		bias-disable;
+		slew-rate = "very-high-speed";
+	};
+	dcmi_d7_pb9: dcmi_d7_pb9 {
+		pinmux = <STM32_PINMUX('B', 9, AF10)>;
+		bias-disable;
+		slew-rate = "very-high-speed";
+	};
+
+	/* I2C3 on PC0/PC1 — AF4 for STM32U585 */
+	i2c3_scl_pc0: i2c3_scl_pc0 {
+		pinmux = <STM32_PINMUX('C', 0, AF4)>;
+		bias-disable;
+		drive-open-drain;
+		slew-rate = "very-high-speed";
+	};
+	i2c3_sda_pc1: i2c3_sda_pc1 {
+		pinmux = <STM32_PINMUX('C', 1, AF4)>;
+		bias-disable;
+		drive-open-drain;
+		slew-rate = "very-high-speed";
+	};
+};
+
+/* I2C3 — OV5640 control bus */
+&i2c3 {
+	pinctrl-0 = <&i2c3_scl_pc0 &i2c3_sda_pc1>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	ov5640: ov5640@3c {
+		compatible = "ovti,ov5640";
+		reg = <0x3c>;
+		status = "okay";
+
+		reset-gpios     = <&gpioc 5 GPIO_ACTIVE_LOW>;
+		powerdown-gpios = <&gpioc 4 GPIO_ACTIVE_HIGH>;
+
+		port {
+			ov5640_ep_out: endpoint {
+				remote-endpoint-label = "dcmi_ep_in";
+				bus-type = <VIDEO_BUS_TYPE_PARALLEL>;
+			};
+		};
+	};
+};
