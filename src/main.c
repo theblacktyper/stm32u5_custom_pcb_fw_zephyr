@@ -10,8 +10,13 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(kk_edge_ai, LOG_LEVEL_INF);
 
-#include "main_functions.h"  /* TFLM person detection: setup (inference thread), run (camera thread) */
-#include "tflm_hello_world/model_settings.h"  /* kNumCols/kNumRows = 96x96 NN crop */
+/* Set to 1 to enable TFLM inference thread; 0 to disable for camera-only testing. */
+#define ENABLE_INFERENCE  1
+
+#if ENABLE_INFERENCE
+#include "main_functions.h"
+#include "tflm_hello_world/model_settings.h"
+#endif
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/display.h>
@@ -22,6 +27,7 @@ LOG_MODULE_REGISTER(kk_edge_ai, LOG_LEVEL_INF);
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <version.h>
+#include <stdbool.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,7 +35,7 @@ LOG_MODULE_REGISTER(kk_edge_ai, LOG_LEVEL_INF);
 
 /* size of stack area used by threads */
 #define DEFAULT_STACKSIZE    1024
-#define INFERENCE_STACKSIZE  2048
+#define INFERENCE_STACKSIZE  4096
 #define CAMERA_STACKSIZE     8192
 
 /* scheduling priority: lower number = higher priority in Zephyr */
@@ -73,16 +79,70 @@ static volatile uint8_t is_cam_capture_started = 0;
 static volatile uint8_t is_zoom_2x = 0;
 
 /*
- * STM32U5 GPDMA block-transfer limit is 65 535 bytes (16-bit BNDT register).
- * 320x240 RGB565 = 153 600 bytes — exceeds the limit, HAL rejects the DMA.
- * 160x120 RGB565 =  38 400 bytes — fits comfortably.
+ * Camera resolution toggle:
+ *   Comment/uncomment to switch between 160x120 and 320x240.
+ *   320x240 uses GPDMA linked-list mode (CONFIG_VIDEO_STM32U5_DCMI_LLI).
  */
-#define CAMERA_W          160
-#define CAMERA_H          120
+#define CAMERA_RES_320x240
+
+#if defined(CAMERA_RES_320x240)
+  #define CAMERA_W          320
+  #define CAMERA_H          240
+#else
+  #define CAMERA_W          160
+  #define CAMERA_H          120
+#endif
+
 #define DISPLAY_W         240
 #define DISPLAY_H         135
-#define FRAME_X_OFFSET    ((DISPLAY_W - CAMERA_W) / 2)   /* center 160 on 240 */
-#define FRAME_Y_OFFSET    ((DISPLAY_H - CAMERA_H) / 2)   /* center 120 on 135 */
+
+/*
+ * USE_160x120_CROP: when camera is 320x240, use center 160x120 crop and display 1:1.
+ * No scaling - fast memcpy path. Fits on 240x135 display.
+ */
+#define USE_160x120_CROP  1
+
+#if defined(USE_160x120_CROP) && USE_160x120_CROP && defined(CAMERA_RES_320x240)
+  /* 160x120 center crop from 320x240, 1:1 display */
+  #define FRAME_DISP_W    160
+  #define FRAME_DISP_H    120
+  #define FRAME_CROP_X0   80   /* (320 - 160) / 2 */
+  #define FRAME_CROP_Y0   60   /* (240 - 120) / 2 */
+#elif (CAMERA_W <= DISPLAY_W && CAMERA_H <= DISPLAY_H)
+  #define FRAME_DISP_W  CAMERA_W
+  #define FRAME_DISP_H  CAMERA_H
+#elif (CAMERA_W * DISPLAY_H <= CAMERA_H * DISPLAY_W)
+  /* Height-limited: scale to fit height */
+  #define FRAME_DISP_H  DISPLAY_H
+  #define FRAME_DISP_W  (CAMERA_W * DISPLAY_H / CAMERA_H)
+#else
+  /* Width-limited: scale to fit width */
+  #define FRAME_DISP_W  DISPLAY_W
+  #define FRAME_DISP_H  (CAMERA_H * DISPLAY_W / CAMERA_W)
+#endif
+
+#define FRAME_X_OFFSET    ((DISPLAY_W - FRAME_DISP_W) / 2)
+#define FRAME_Y_OFFSET    ((DISPLAY_H - FRAME_DISP_H) / 2)
+
+#define CAMERA_FRAME_BYTES (CAMERA_W * CAMERA_H * sizeof(uint16_t))
+
+#if (CONFIG_VIDEO_BUFFER_POOL_NUM_MAX >= 1)
+/* Static buffers to avoid blocking on empty pool (pool may be used elsewhere at init) */
+static uint8_t __aligned(64) camera_frame_buf[CAMERA_FRAME_BYTES];
+static struct video_buffer camera_static_vbuf = {
+	.buffer = camera_frame_buf,
+	.size = sizeof(camera_frame_buf),
+	.type = VIDEO_BUF_TYPE_OUTPUT,
+};
+#if (CONFIG_VIDEO_BUFFER_POOL_NUM_MAX >= 2)
+static uint8_t __aligned(64) camera_frame_buf1[CAMERA_FRAME_BYTES];
+static struct video_buffer camera_static_vbuf1 = {
+	.buffer = camera_frame_buf1,
+	.size = sizeof(camera_frame_buf1),
+	.type = VIDEO_BUF_TYPE_OUTPUT,
+};
+#endif
+#endif
 
 #define STANDBY_TEXT_MAX_LEN 24
 
@@ -102,12 +162,24 @@ static int64_t fps_start_ms;
 static float fps_current;
 static float fps_last_logged = -1.0f;
 
-/* Shared frame and scores between camera and inference threads */
-static uint8_t latest_frame[CAMERA_W * CAMERA_H * sizeof(uint16_t)];
-K_MUTEX_DEFINE(latest_frame_mutex);
-static atomic_t latest_frame_valid = ATOMIC_INIT(0);
+#if ENABLE_INFERENCE
+/* Most recent frame handed off from camera_thread to inference_thread. */
+static struct video_buffer *inference_vbuf;
+K_MUTEX_DEFINE(inference_vbuf_mutex);
+static atomic_t inference_pending = ATOMIC_INIT(0);
+#if (CONFIG_VIDEO_BUFFER_POOL_NUM_MAX == 1)
+/* Signalled when inference has enqueued the buffer (so camera can start next capture). */
+static K_SEM_DEFINE(buffer_returned_sem, 0, 1);
+#endif /* CONFIG_VIDEO_BUFFER_POOL_NUM_MAX == 1 */
+/* Signalled when camera hands off a frame (wakes inference immediately). */
+static K_SEM_DEFINE(inference_frame_ready_sem, 0, 1);
+/* Run inference every Nth frame (1=every frame, 2=every other, etc.). */
+#define INFERENCE_EVERY_N_FRAMES  4
+static uint32_t inference_frame_counter;
+static bool last_frame_handed_off;
 static int8_t latest_person_score;
 static int8_t latest_no_person_score;
+#endif
 
 struct led {
 	struct gpio_dt_spec spec;
@@ -127,7 +199,13 @@ static const struct led led1 = {
 static struct gpio_callback button_cb_data;
 static struct gpio_callback button_sec_cb_data;
 
+/* Work item to start camera capture from button press (thread context). */
+static void start_capture_work_handler(struct k_work *work);
+static K_WORK_DEFINE(start_capture_work, start_capture_work_handler);
+
 /* ---- OV5640 zoom control (1x / 2x) -------------------------------------- */
+
+#define ENABLE_ZOOM_BUTTONS 0
 
 enum ov5640_zoom_level {
 	OV5640_ZOOM_1X = 0,
@@ -192,24 +270,39 @@ static void button_pressed_cb(const struct device *dev,
 			      struct gpio_callback *cb,
 			      uint32_t pins)
 {
+#if !ENABLE_ZOOM_BUTTONS
+	ARG_UNUSED(dev);
+	ARG_UNUSED(cb);
+	ARG_UNUSED(pins);
+#endif
+
 	if (!is_cam_capture_started) {
-		k_sem_give(&capture_sem);
-	} else {
+		k_work_submit(&start_capture_work);
+	}
+#if ENABLE_ZOOM_BUTTONS
+	else {
 		/* Zoom - : request 1x when capture is running */
 		requested_zoom = OV5640_ZOOM_1X;
 		k_work_submit(&ov5640_zoom_work);
 	}
+#endif
 }
 // Button 1 (sw1)
 static void button_sec_pressed_cb(const struct device *dev,
 			      struct gpio_callback *cb,
 			      uint32_t pins)
 {
+#if !ENABLE_ZOOM_BUTTONS
+	ARG_UNUSED(dev);
+	ARG_UNUSED(cb);
+	ARG_UNUSED(pins);
+#else
 	if (is_cam_capture_started) {
 		/* Zoom + : request 2x when capture is running */
 		requested_zoom = OV5640_ZOOM_2X;
 		k_work_submit(&ov5640_zoom_work);
 	}
+#endif
 }
 
 /* ---- 8x16 bitmap font for printable ASCII 0x20-0x7E (VGA style) -------- */
@@ -341,6 +434,13 @@ static uint8_t get_bpp(enum display_pixel_format fmt)
 	case PIXEL_FORMAT_BGR_565:   return 2;
 	default:                     return 1;
 	}
+}
+
+static void start_capture_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	k_sem_give(&capture_sem);
 }
 
 /**
@@ -586,7 +686,7 @@ static void draw_string_on_rgb565(uint8_t *dst, uint16_t x0, uint16_t y0,
 }
 
 /*
- * Draw person detection overlay: bar at top (green if person >= 50%, else red) + person % in yellow.
+ * Draw person detection overlay: green if person >= 50%, else red.
  * Int8 softmax: scale 1/256, zero_point -128 -> percentage = (val + 128) * 100 / 256.
  */
 static int clamp_pct(int val)
@@ -602,20 +702,18 @@ static int clamp_pct(int val)
 
 static void draw_person_overlay(uint8_t *dst, int8_t person_score, int8_t no_person_score)
 {
-	/* Person score as percentage (person class only) */
+#if !ENABLE_INFERENCE
+	(void)dst; (void)person_score; (void)no_person_score;
+	return;
+#else
 	int person_pct = clamp_pct((int)(person_score + 128) * 100 / 256);
-	/* Border: green when person >= 50%, otherwise red */
-	int person_at_least_half = (person_pct >= 75);
-	uint16_t bar_color = person_at_least_half ? COLOR_GREEN : COLOR_RED;
+	int person_at_least_half = (person_pct >= 50);
+	uint32_t bar_color = person_at_least_half ? COLOR_GREEN : COLOR_RED;
 
-	/* Draw a colored border around the live 160x120 camera image:
-	 * top, bottom, left, and right edges. Make it a few pixels thick
-	 * so it is easy to see.
-	 */
 	int x0 = FRAME_X_OFFSET;
 	int y0 = FRAME_Y_OFFSET;
-	int x1 = FRAME_X_OFFSET + CAMERA_W - 1;
-	int y1 = FRAME_Y_OFFSET + CAMERA_H - 1;
+	int x1 = FRAME_X_OFFSET + FRAME_DISP_W - 1;
+	int y1 = FRAME_Y_OFFSET + FRAME_DISP_H - 1;
 
 	if (x0 < 0) x0 = 0;
 	if (y0 < 0) y0 = 0;
@@ -624,7 +722,6 @@ static void draw_person_overlay(uint8_t *dst, int8_t person_score, int8_t no_per
 
 	const int border_thickness = 3;
 
-	/* Vertical edges (left/right), thicker by a few pixels. */
 	for (int t = 0; t < border_thickness; t++) {
 		int lx = x0 + t;
 		int rx = x1 - t;
@@ -637,7 +734,6 @@ static void draw_person_overlay(uint8_t *dst, int8_t person_score, int8_t no_per
 		}
 	}
 
-	/* Horizontal edges (top/bottom), thicker by a few pixels. */
 	for (int t = 0; t < border_thickness; t++) {
 		int ty = y0 + t;
 		int by = y1 - t;
@@ -650,12 +746,8 @@ static void draw_person_overlay(uint8_t *dst, int8_t person_score, int8_t no_per
 		}
 	}
 
-	/* Person score percentage always in yellow */
 	char buf[8];
 	snprintf(buf, sizeof(buf), "%d%%", person_pct);
-	/* Place text well above the top border so it does not overlap
-	 * the live image or affect its appearance.
-	 */
 	int text_y = FRAME_Y_OFFSET - (FONT_H + 4);
 	if (text_y < 0) {
 		text_y = 0;
@@ -663,17 +755,25 @@ static void draw_person_overlay(uint8_t *dst, int8_t person_score, int8_t no_per
 	draw_string_on_rgb565(dst, (uint16_t)FRAME_X_OFFSET + 5, (uint16_t)text_y + 10,
 			      buf, COLOR_YELLOW);
 	(void)no_person_score;
+#endif
 }
 
 /**
- * Copy 160x120 frame 1:1 (no scaling), centred on 240x135 display.
- * Black borders fill the margins.
- * Draw person detection overlay (bar + optional label) using given scores.
+ * Copy camera frame to display buffer, centred on DISPLAY_W x DISPLAY_H.
+ *
+ * USE_160x120_CROP (320x240 camera): center 160x120 crop, 1:1 memcpy - no scaling.
+ *
+ * When CAMERA_W/H fits inside the display (e.g. 160x120 on 240x135):
+ *   1x zoom -> 1:1 memcpy into the centred window.
+ *   2x zoom -> crop centre half and scale up 2x with nearest-neighbor.
+ *
+ * When CAMERA_W/H is larger (e.g. 320x240 on 240x135, without USE_160x120_CROP):
+ *   1x zoom -> nearest-neighbor downscale to FRAME_DISP_W x FRAME_DISP_H.
+ *   2x zoom -> crop centre half then downscale to the same display area.
  */
 static void copy_frame_to_display(const uint8_t *src, uint8_t *dst,
 				  int8_t person_score, int8_t no_person_score)
 {
-	/* One-time clear of borders; camera region is fully overwritten each frame. */
 	static int borders_cleared;
 
 	const uint16_t *s = (const uint16_t *)src;
@@ -684,41 +784,69 @@ static void copy_frame_to_display(const uint8_t *src, uint8_t *dst,
 		borders_cleared = 1;
 	}
 
+#if defined(USE_160x120_CROP) && USE_160x120_CROP && defined(CAMERA_RES_320x240)
+	/*
+	 * Fast path: 160x120 center crop from 320x240, 1:1 memcpy - no scaling.
+	 */
+	for (int y = 0; y < FRAME_DISP_H; y++) {
+		const uint16_t *src_row = s + (FRAME_CROP_Y0 + y) * CAMERA_W + FRAME_CROP_X0;
+		uint16_t *dst_row = d + (FRAME_Y_OFFSET + y) * DISPLAY_W + FRAME_X_OFFSET;
+		memcpy(dst_row, src_row, FRAME_DISP_W * sizeof(uint16_t));
+	}
+#else
+	/* Source ROI: full frame for 1x, centre half for 2x */
+	int roi_x0, roi_y0, roi_w, roi_h;
+
 	if (!is_zoom_2x) {
-		/* 1x: direct 160x120 copy into centered window */
+		roi_x0 = 0;
+		roi_y0 = 0;
+		roi_w = CAMERA_W;
+		roi_h = CAMERA_H;
+	} else {
+		roi_w = CAMERA_W / 2;
+		roi_h = CAMERA_H / 2;
+		roi_x0 = (CAMERA_W - roi_w) / 2;
+		roi_y0 = (CAMERA_H - roi_h) / 2;
+	}
+
+#if (CAMERA_W <= DISPLAY_W && CAMERA_H <= DISPLAY_H)
+	/*
+	 * Camera fits on display (e.g. 160x120).
+	 * 1x: direct 1:1 copy. 2x: nearest-neighbor 2x upscale from half-ROI.
+	 */
+	if (!is_zoom_2x) {
 		for (int y = 0; y < CAMERA_H; y++) {
 			const uint16_t *src_row = s + y * CAMERA_W;
 			uint16_t *dst_row = d + (FRAME_Y_OFFSET + y) * DISPLAY_W + FRAME_X_OFFSET;
-
 			memcpy(dst_row, src_row, CAMERA_W * sizeof(uint16_t));
 		}
 	} else {
-		/* 2x digital zoom in software:
-		 * take the central 80x60 region of the 160x120 frame and
-		 * scale it up 2x2 to fill 160x120.
-		 *
-		 * Source window:
-		 *   src_w = CAMERA_W / 2 = 80
-		 *   src_h = CAMERA_H / 2 = 60
-		 *   src_x0 = (CAMERA_W - src_w) / 2 = 40
-		 *   src_y0 = (CAMERA_H - src_h) / 2 = 30
-		 */
-		const int src_w = CAMERA_W / 2;
-		const int src_h = CAMERA_H / 2;
-		const int src_x0 = (CAMERA_W - src_w) / 2;
-		const int src_y0 = (CAMERA_H - src_h) / 2;
-
-		for (int y = 0; y < CAMERA_H; y++) {
-			int src_y = src_y0 + (y / 2);
-			const uint16_t *src_row = s + src_y * CAMERA_W;
-			uint16_t *dst_row = d + (FRAME_Y_OFFSET + y) * DISPLAY_W + FRAME_X_OFFSET;
-
-			for (int x = 0; x < CAMERA_W; x++) {
-				int src_x = src_x0 + (x / 2);
-				dst_row[x] = src_row[src_x];
+		for (int dy = 0; dy < CAMERA_H; dy++) {
+			int sy = roi_y0 + (dy / 2);
+			const uint16_t *src_row = s + sy * CAMERA_W;
+			uint16_t *dst_row = d + (FRAME_Y_OFFSET + dy) * DISPLAY_W + FRAME_X_OFFSET;
+			for (int dx = 0; dx < CAMERA_W; dx++) {
+				int sx = roi_x0 + (dx / 2);
+				dst_row[dx] = src_row[sx];
 			}
 		}
 	}
+#else
+	/*
+	 * Camera is larger than the display (e.g. 320x240 on 240x135).
+	 * Downscale the ROI to FRAME_DISP_W x FRAME_DISP_H with nearest-neighbor.
+	 */
+	for (int dy = 0; dy < FRAME_DISP_H; dy++) {
+		int sy = roi_y0 + dy * roi_h / FRAME_DISP_H;
+		const uint16_t *src_row = s + sy * CAMERA_W;
+		uint16_t *dst_row = d + (FRAME_Y_OFFSET + dy) * DISPLAY_W + FRAME_X_OFFSET;
+		for (int dx = 0; dx < FRAME_DISP_W; dx++) {
+			int sx = roi_x0 + dx * roi_w / FRAME_DISP_W;
+			dst_row[dx] = src_row[sx];
+		}
+	}
+#endif
+#endif
 
 	draw_person_overlay(dst, person_score, no_person_score);
 }
@@ -737,10 +865,18 @@ void camera_thread(void)
 		return;
 	}
 
-	/* Allocate video buffers from the video buffer pool */
-	size_t frame_size = CAMERA_W * CAMERA_H * sizeof(uint16_t);
+	size_t frame_size = CAMERA_FRAME_BYTES;
 	struct video_buffer *vbufs[CONFIG_VIDEO_BUFFER_POOL_NUM_MAX];
 
+#if (CONFIG_VIDEO_BUFFER_POOL_NUM_MAX == 1)
+	/* Use static buffer; pool may have no buffers available at runtime */
+	vbufs[0] = &camera_static_vbuf;
+#elif (CONFIG_VIDEO_BUFFER_POOL_NUM_MAX == 2)
+	/* Double-buffer: use two static buffers for pipelined capture */
+	vbufs[0] = &camera_static_vbuf;
+	vbufs[1] = &camera_static_vbuf1;
+#else
+	/* Allocate video buffers from the video buffer pool */
 	for (int i = 0; i < ARRAY_SIZE(vbufs); i++) {
 		vbufs[i] = video_buffer_aligned_alloc(
 				frame_size,
@@ -752,10 +888,10 @@ void camera_thread(void)
 		}
 		vbufs[i]->type = VIDEO_BUF_TYPE_OUTPUT;
 	}
+#endif
 
 	/* Allocate output buffer: full display width so borders are included */
 	uint8_t *disp_buf = k_malloc(DISPLAY_W * DISPLAY_H * sizeof(uint16_t));
-
 	if (disp_buf == NULL) {
 		LOG_ERR("> Failed to allocate camera display buffer");
 		return;
@@ -777,7 +913,9 @@ void camera_thread(void)
 
 	/* Wait for SW0 press before starting capture; then run until power cycle */
 	k_sem_take(&capture_sem, K_FOREVER);
-    if (!is_cam_capture_started) is_cam_capture_started = 1;
+	if (!is_cam_capture_started) {
+		is_cam_capture_started = 1;
+	}
 	LOG_INF("Capture started");
 
 	/* Enqueue all buffers before starting */
@@ -792,8 +930,27 @@ void camera_thread(void)
 	frame_count = 0;
 	fps_start_ms = k_uptime_get();
 
+#if (CONFIG_VIDEO_BUFFER_POOL_NUM_MAX == 1)
+	static bool first_capture = true;
+#endif
+
 	while (1) {
 		struct video_buffer *vbuf;
+
+#if (CONFIG_VIDEO_BUFFER_POOL_NUM_MAX == 1)
+		if (!first_capture) {
+#if ENABLE_INFERENCE
+			/* Single-buffer: wait if we handed off the previous frame (inference has the buffer). */
+			if (last_frame_handed_off) {
+				k_sem_take(&buffer_returned_sem, K_FOREVER);
+			}
+#else
+			/* Single-buffer, no inference: we already enqueued at end of previous iteration; nothing to wait for. */
+			(void)vbuf;
+#endif
+		}
+#endif
+		/* With 2+ buffers: always have one available for next capture; no wait needed. */
 
 		/* DCMI driver captures one frame per start; both modes need start per frame */
 		ret = video_stream_start(video_dev, VIDEO_BUF_TYPE_OUTPUT);
@@ -825,16 +982,57 @@ void camera_thread(void)
 
 		video_stream_stop(video_dev, VIDEO_BUF_TYPE_OUTPUT);
 
-		/* Publish latest frame for inference thread (non-blocking copy). */
-		k_mutex_lock(&latest_frame_mutex, K_FOREVER);
-		memcpy(latest_frame, vbuf->buffer, frame_size);
-		atomic_set(&latest_frame_valid, 1);
-		k_mutex_unlock(&latest_frame_mutex);
+#if (CONFIG_VIDEO_BUFFER_POOL_NUM_MAX == 1)
+		first_capture = false;
+#endif
 
-		/* Use latest known scores from inference thread for overlay. */
-		int8_t person_score = latest_person_score;
-		int8_t no_person_score = latest_no_person_score;
-		copy_frame_to_display(vbuf->buffer, disp_buf, person_score, no_person_score);
+#if ENABLE_INFERENCE
+		{
+			bool run_inference = (inference_frame_counter % INFERENCE_EVERY_N_FRAMES) == 0;
+
+			if (run_inference && !atomic_get(&inference_pending)) {
+				k_mutex_lock(&inference_vbuf_mutex, K_FOREVER);
+				inference_vbuf = vbuf;
+				atomic_set(&inference_pending, 1);
+				k_mutex_unlock(&inference_vbuf_mutex);
+				k_sem_give(&inference_frame_ready_sem);
+				last_frame_handed_off = true;
+			} else {
+				video_enqueue(video_dev, vbuf);
+				last_frame_handed_off = false;
+			}
+			inference_frame_counter++;
+		}
+#else
+		/* Re-enqueue for next capture (no inference hand-off). */
+		video_enqueue(video_dev, vbuf);
+#endif
+
+		{
+#if ENABLE_INFERENCE
+			int8_t person_score = latest_person_score;
+			int8_t no_person_score = latest_no_person_score;
+#else
+			int8_t person_score = -128;
+			int8_t no_person_score = -128;
+#endif
+			copy_frame_to_display(vbuf->buffer, disp_buf,
+					      person_score, no_person_score);
+
+			/* Sync LEDs with display overlay: green on when green border, all off when red border */
+			{
+				int pct = (int)(person_score + 128) * 100 / 256;
+				if (pct < 0) pct = 0;
+				if (pct > 100) pct = 100;
+				int person_detected = (pct >= 50);
+				if (gpio_is_ready_dt(&led0.spec)) {
+					gpio_pin_set_dt(&led0.spec, person_detected);
+				}
+				if (gpio_is_ready_dt(&led1.spec)) {
+					gpio_pin_set_dt(&led1.spec, 0);  /* Red LED always off */
+				}
+			}
+		}
 
 		atomic_set(&show_camera_frame, 1);
 
@@ -862,9 +1060,6 @@ void camera_thread(void)
 				}
 			}
 		}
-
-		/* Re-enqueue for next capture */
-		video_enqueue(video_dev, vbuf);
 
 		/* Drain any extra buffers */
 		{
@@ -1108,6 +1303,18 @@ void blink1(void)
 	blink(&led1, 125, 1);
 }
 
+static void init_leds(void)
+{
+	if (gpio_is_ready_dt(&led0.spec)) {
+		gpio_pin_configure_dt(&led0.spec, GPIO_OUTPUT);
+		gpio_pin_set_dt(&led0.spec, 0);
+	}
+	if (gpio_is_ready_dt(&led1.spec)) {
+		gpio_pin_configure_dt(&led1.spec, GPIO_OUTPUT);
+		gpio_pin_set_dt(&led1.spec, 0);
+	}
+}
+
 static void init_usr_buttons(void)
 {
 	int ret;
@@ -1166,6 +1373,7 @@ int main(void)
 	LOG_INF("==============================\n");
 
 	init_usr_buttons();
+	init_leds();
 
 	/* Init camera sensor + video capture (DCMI) device */
 	if (!device_is_ready(ov5640)) {
@@ -1249,89 +1457,64 @@ int main(void)
 	LOG_INF("Camera configured: RGB565 %ux%u (hflip=%d vflip=%d)\n", CAMERA_W, CAMERA_H,
 		want_hflip, want_vflip);
 
-	/* TFLM overlay is filled by inference thread; no setup here */
-
 	// LOG_INF("====== Threads STARTING ======");
 	LOG_INF("Press Button 2 to start capture...\n");
 
 	return 0;
 }
 
-/* Dedicated inference thread: runs TFLM person detection on latest frame periodically. */
+#if ENABLE_INFERENCE
 static void inference_thread(void)
 {
-	static uint8_t inference_frame[CAMERA_W * CAMERA_H * sizeof(uint16_t)];
-
 	tflm_person_detection_setup();
 
 	while (1) {
-		/* Wait until TFLM is ready and we have at least one frame. */
-		if (!tflm_person_detection_ready() ||
-		    !atomic_get(&latest_frame_valid)) {
-			k_msleep(100);
+		k_sem_take(&inference_frame_ready_sem, K_FOREVER);
+
+		struct video_buffer *vbuf = NULL;
+		k_mutex_lock(&inference_vbuf_mutex, K_FOREVER);
+		if (atomic_get(&inference_pending) && inference_vbuf != NULL) {
+			vbuf = inference_vbuf;
+			inference_vbuf = NULL;
+			atomic_set(&inference_pending, 0);
+		}
+		k_mutex_unlock(&inference_vbuf_mutex);
+
+		if (vbuf == NULL) {
 			continue;
 		}
 
-		/* Build inference frame under mutex to keep a consistent view. */
-		k_mutex_lock(&latest_frame_mutex, K_FOREVER);
-		if (!is_zoom_2x) {
-			/* 1x: direct copy of 160x120 frame */
-			memcpy(inference_frame, latest_frame, sizeof(inference_frame));
-		} else {
-			/* 2x: build a 160x120 frame where the central 80x60 region
-			 * is the zoomed ROI (1:1 pixels), and the rest is padded.
-			 * TFLM will then center-crop 96x96 from this, so the 80x60
-			 * content appears centered with padding around it.
-			 */
-			const uint16_t *src = (const uint16_t *)latest_frame;
-			uint16_t *dst = (uint16_t *)inference_frame;
-			const int src_w = CAMERA_W / 2;   /* 80 */
-			const int src_h = CAMERA_H / 2;   /* 60 */
-			const int src_x0 = (CAMERA_W - src_w) / 2;  /* 40 */
-			const int src_y0 = (CAMERA_H - src_h) / 2;  /* 30 */
-
-			/* Clear entire frame to black (padding). */
-			memset(dst, 0x00, CAMERA_W * CAMERA_H * sizeof(uint16_t));
-
-			/* Place 80x60 ROI centered within the 96x96 NN crop area.
-			 * NN crop: x in [32, 127], y in [12, 107]
-			 * We want ROI (80x60) centered there:
-			 *   pad_x = (96 - 80)/2 = 8, pad_y = (96 - 60)/2 = 18
-			 *   dest_x0 = 32 + 8 = 40, dest_y0 = 12 + 18 = 30
-			 */
-			const int dest_x0 = 40;
-			const int dest_y0 = 30;
-
-			for (int ry = 0; ry < src_h; ry++) {
-				int sy = src_y0 + ry;
-				const uint16_t *src_row = src + sy * CAMERA_W;
-				uint16_t *dst_row = dst + (dest_y0 + ry) * CAMERA_W;
-
-				for (int rx = 0; rx < src_w; rx++) {
-					int sx = src_x0 + rx;
-					dst_row[dest_x0 + rx] = src_row[sx];
-				}
-			}
+		if (!tflm_person_detection_ready()) {
+			video_enqueue(video_dev, vbuf);
+#if (CONFIG_VIDEO_BUFFER_POOL_NUM_MAX == 1)
+			k_sem_give(&buffer_returned_sem);
+#endif
+			continue;
 		}
-		k_mutex_unlock(&latest_frame_mutex);
 
 		int8_t person_score = 0;
 		int8_t no_person_score = 0;
 
-		int rc = tflm_person_detection_run(inference_frame, &person_score, &no_person_score);
+		int rc = tflm_person_detection_run((const uint8_t *)vbuf->buffer,
+					   CAMERA_W, CAMERA_H,
+					   &person_score, &no_person_score);
 
 		if (rc == 0) {
 			latest_person_score = person_score;
 			latest_no_person_score = no_person_score;
 		}
 
-		/* Small delay between inferences; main cost is the model itself. */
-		// k_msleep(50);
+		/* Return buffer to the video queue after inference completes. */
+		video_enqueue(video_dev, vbuf);
+#if (CONFIG_VIDEO_BUFFER_POOL_NUM_MAX == 1)
+		k_sem_give(&buffer_returned_sem);
+#endif
 	}
 }
 
 K_THREAD_DEFINE(inference_id, INFERENCE_STACKSIZE, inference_thread, NULL, NULL, NULL,
 		PRIORITY_CAMERA, 0, 0);
+#endif /* ENABLE_INFERENCE */
 K_THREAD_DEFINE(display_id, DEFAULT_STACKSIZE, display_thread, NULL, NULL, NULL,
 		PRIORITY_CAMERA, 0, 0);
 // K_THREAD_DEFINE(blink0_id, DEFAULT_STACKSIZE, blink0, NULL, NULL, NULL,

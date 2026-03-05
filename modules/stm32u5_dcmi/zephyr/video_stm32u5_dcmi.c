@@ -3,6 +3,9 @@
  * Compatible: st,stm32u5-dcmi. Use this so the in-tree video_stm32_dcmi.c
  * can stay unmodified; disable CONFIG_VIDEO_STM32_DCMI for the board.
  *
+ * For frames larger than GPDMA_BNDT_MAX_BYTES, uses GPDMA linked-list mode
+ * (multiple nodes per frame) so that e.g. 320x240 RGB565 can be captured.
+ *
  * Based on Zephyr drivers/video/video_stm32_dcmi.c
  * Copyright (c) 2024 Charles Dias <charlesdias.cd@outlook.com>
  * SPDX-License-Identifier: Apache-2.0
@@ -11,6 +14,7 @@
 #define DT_DRV_COMPAT st_stm32u5_dcmi
 
 #include <errno.h>
+#include <string.h>
 
 #include <zephyr/kernel.h>
 #include <zephyr/irq.h>
@@ -26,11 +30,19 @@
 
 #include "video_device.h"
 
+#if defined(CONFIG_VIDEO_STM32U5_DCMI_LLI)
+#include <stm32u5xx_hal_dma_ex.h>
+#endif
+
 LOG_MODULE_REGISTER(video_stm32u5_dcmi, CONFIG_VIDEO_LOG_LEVEL);
 
-#if CONFIG_VIDEO_BUFFER_POOL_NUM_MAX < 2
-#error "The minimum required number of buffers for video_stm32 is 2"
+#if CONFIG_VIDEO_BUFFER_POOL_NUM_MAX < 1
+#error "The minimum required number of buffers for video_stm32u5_dcmi is 1"
 #endif
+
+/* GPDMA BNDT is 16-bit; max bytes per block. Use multiple of 4 for 32-bit xfer. */
+#define GPDMA_BNDT_MAX_BYTES  65532U
+#define DCMI_LLI_NODES_MAX    4
 
 typedef void (*irq_config_func_t)(const struct device *dev);
 
@@ -49,6 +61,9 @@ struct video_stm32_dcmi_data {
 	struct k_fifo fifo_in;
 	struct k_fifo fifo_out;
 	struct video_buffer *vbuf;
+#if defined(CONFIG_VIDEO_STM32U5_DCMI_LLI)
+	bool capture_uses_lli;  /* true when current capture uses linked-list DMA */
+#endif
 };
 
 struct video_stm32_dcmi_config {
@@ -64,29 +79,45 @@ void HAL_DCMI_ErrorCallback(DCMI_HandleTypeDef *hdcmi)
 	LOG_WRN("%s", __func__);
 }
 
+/* Shared frame-done handling: deliver filled buffer to app.
+ * With 2+ buffers: deliver DMA buffer directly; return the other buffer to fifo_in
+ * for the next capture (no memcpy - saves ~1-2 ms per frame).
+ * With 1 buffer: fifo_in is empty; deliver the DMA buffer directly.
+ */
+static void dcmi_frame_done(struct video_stm32_dcmi_data *dev_data)
+{
+	struct video_buffer *vbuf = k_fifo_get(&dev_data->fifo_in, K_NO_WAIT);
+
+	if (dev_data->vbuf != NULL) {
+		/* Deliver DMA buffer directly (no copy). */
+		dev_data->vbuf->timestamp = k_uptime_get_32();
+		k_fifo_put(&dev_data->fifo_out, dev_data->vbuf);
+		dev_data->vbuf = NULL;
+	}
+	if (vbuf != NULL) {
+		/* Return the unused buffer to pool for next capture. */
+		k_fifo_put(&dev_data->fifo_in, vbuf);
+	}
+}
+
 void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *hdcmi)
 {
 	struct video_stm32_dcmi_data *dev_data =
 			CONTAINER_OF(hdcmi, struct video_stm32_dcmi_data, hdcmi);
-	struct video_buffer *vbuf;
+
+#if defined(CONFIG_VIDEO_STM32U5_DCMI_LLI)
+	/* When using linked-list DMA, completion is signalled in the DMA callback. */
+	if (dev_data->capture_uses_lli) {
+		return;
+	}
+#endif
 
 	/*
 	 * With GPDMA (DMA_NORMAL) + DCMI_MODE_SNAPSHOT both the DMA and the
 	 * DCMI have already stopped by the time this callback fires, so
 	 * Suspend/Resume are unnecessary and would restart an unwanted capture.
 	 */
-
-	vbuf = k_fifo_get(&dev_data->fifo_in, K_NO_WAIT);
-
-	if (vbuf == NULL) {
-		LOG_DBG("Failed to get buffer from fifo");
-		return;
-	}
-
-	vbuf->timestamp = k_uptime_get_32();
-	memcpy(vbuf->buffer, dev_data->vbuf->buffer, vbuf->bytesused);
-
-	k_fifo_put(&dev_data->fifo_out, vbuf);
+	dcmi_frame_done(dev_data);
 }
 
 static void stm32_dcmi_isr(const struct device *dev)
@@ -113,6 +144,23 @@ void HAL_DMA_ErrorCallback(DMA_HandleTypeDef *hdma)
 {
 	LOG_WRN("%s", __func__);
 }
+
+#if defined(CONFIG_VIDEO_STM32U5_DCMI_LLI)
+static struct video_stm32_dcmi_data *lli_owner;
+
+static void dcmi_dma_lli_xfer_cplt(DMA_HandleTypeDef *hdma)
+{
+	struct video_stm32_dcmi_data *dev_data = lli_owner;
+
+	if (dev_data == NULL) {
+		return;
+	}
+
+	(void)HAL_DCMI_Stop(&dev_data->hdcmi);
+	dcmi_frame_done(dev_data);
+	dev_data->capture_uses_lli = false;
+}
+#endif
 
 static int stm32_dma_init(const struct device *dev)
 {
@@ -234,7 +282,11 @@ static int video_stm32_dcmi_set_stream(const struct device *dev, bool enable,
 			return -EIO;
 		}
 
-		k_fifo_put(&data->fifo_in, data->vbuf);
+		/* Only put back if still held (single-buffer path may have already delivered it). */
+		if (data->vbuf != NULL) {
+			k_fifo_put(&data->fifo_in, data->vbuf);
+			data->vbuf = NULL;
+		}
 
 		return 0;
 	}
@@ -249,13 +301,106 @@ static int video_stm32_dcmi_set_stream(const struct device *dev, bool enable,
 	data->hdcmi.Instance->CR &= ~(DCMI_CR_FCRC_0 | DCMI_CR_FCRC_1);
 	data->hdcmi.Instance->CR |= STM32_DCMI_GET_CAPTURE_RATE(data->capture_rate);
 
-	err = HAL_DCMI_Start_DMA(&data->hdcmi, DCMI_MODE_SNAPSHOT,
-			(uint32_t)data->vbuf->buffer, data->vbuf->bytesused / 4);
-	if (err != HAL_OK) {
-		LOG_ERR("Failed to start DCMI DMA");
-		return -EIO;
-	}
+#if defined(CONFIG_VIDEO_STM32U5_DCMI_LLI)
+	{
+		const uint32_t buffer_size = data->vbuf->bytesused;
 
+		if (buffer_size > GPDMA_BNDT_MAX_BYTES) {
+			DMA_HandleTypeDef *hdma = data->hdcmi.DMA_Handle;
+			const uint32_t dcmi_dr = (uint32_t)&(data->hdcmi.Instance->DR);
+			uint32_t offset = 0U;
+			uint32_t num_nodes = 0U;
+			static DMA_NodeTypeDef lli_nodes[DCMI_LLI_NODES_MAX] __aligned(32);
+			static DMA_QListTypeDef lli_queue;
+			DMA_NodeConfTypeDef node_conf;
+
+			data->capture_uses_lli = true;
+			lli_owner = data;
+
+			memset(&node_conf, 0, sizeof(node_conf));
+			node_conf.NodeType = DMA_GPDMA_LINEAR_NODE;
+			node_conf.Init = hdma->Init;
+			node_conf.SrcAddress = dcmi_dr;
+
+			memset(&lli_queue, 0, sizeof(lli_queue));
+			hdma->LinkedListQueue = &lli_queue;
+
+			hdma->InitLinkedList.Priority = hdma->Init.Priority;
+			hdma->InitLinkedList.LinkStepMode = DMA_LSM_FULL_EXECUTION;
+			hdma->InitLinkedList.LinkAllocatedPort = DMA_LINK_ALLOCATED_PORT0;
+			hdma->InitLinkedList.TransferEventMode = DMA_TCEM_LAST_LL_ITEM_TRANSFER;
+			hdma->InitLinkedList.LinkedListMode = DMA_LINKEDLIST_NORMAL;
+
+			if (HAL_DMAEx_List_Init(hdma) != HAL_OK) {
+				LOG_ERR("Failed to init DMA linked-list");
+				data->capture_uses_lli = false;
+				return -EIO;
+			}
+
+			while (offset < buffer_size && num_nodes < DCMI_LLI_NODES_MAX) {
+				uint32_t chunk = buffer_size - offset;
+
+				if (chunk > GPDMA_BNDT_MAX_BYTES) {
+					chunk = GPDMA_BNDT_MAX_BYTES;
+				}
+				node_conf.DstAddress = (uint32_t)data->vbuf->buffer + offset;
+				node_conf.DataSize = chunk;
+
+				if (HAL_DMAEx_List_BuildNode(&node_conf, &lli_nodes[num_nodes]) != HAL_OK) {
+					LOG_ERR("Failed to build LLI node %u", num_nodes);
+					data->capture_uses_lli = false;
+					return -EIO;
+				}
+				if (num_nodes == 0U) {
+					if (HAL_DMAEx_List_InsertNode_Head(&lli_queue, &lli_nodes[0]) != HAL_OK) {
+						LOG_ERR("Failed to insert LLI head");
+						data->capture_uses_lli = false;
+						return -EIO;
+					}
+				} else {
+					if (HAL_DMAEx_List_InsertNode(&lli_queue,
+								&lli_nodes[num_nodes - 1U],
+								&lli_nodes[num_nodes]) != HAL_OK) {
+						LOG_ERR("Failed to insert LLI node %u", num_nodes);
+						data->capture_uses_lli = false;
+						return -EIO;
+					}
+				}
+				offset += chunk;
+				num_nodes++;
+			}
+
+			if (HAL_DMA_RegisterCallback(hdma, HAL_DMA_XFER_CPLT_CB_ID,
+						     dcmi_dma_lli_xfer_cplt) != HAL_OK) {
+				LOG_ERR("Failed to register LLI complete callback");
+				data->capture_uses_lli = false;
+				return -EIO;
+			}
+
+			if (HAL_DMAEx_List_Start_IT(hdma) != HAL_OK) {
+				LOG_ERR("Failed to start DCMI DMA linked-list");
+				data->capture_uses_lli = false;
+				return -EIO;
+			}
+
+			__HAL_DCMI_ENABLE(&data->hdcmi);
+			data->hdcmi.Instance->CR &= ~(DCMI_CR_CM);
+			data->hdcmi.Instance->CR |= (uint32_t)(DCMI_MODE_SNAPSHOT);
+
+			data->hdcmi.Instance->CR |= DCMI_CR_CAPTURE;
+		} else
+#endif
+		{
+			err = HAL_DCMI_Start_DMA(&data->hdcmi, DCMI_MODE_SNAPSHOT,
+					(uint32_t)data->vbuf->buffer, data->vbuf->bytesused / 4);
+			if (err != HAL_OK) {
+				LOG_ERR("Failed to start DCMI DMA");
+				return -EIO;
+			}
+		}
+#if defined(CONFIG_VIDEO_STM32U5_DCMI_LLI)
+	}
+#endif
 	return video_stream_start(config->sensor_dev, type);
 }
 
@@ -503,6 +648,9 @@ static int video_stm32_dcmi_init(const struct device *dev)
 	k_fifo_init(&data->fifo_in);
 	k_fifo_init(&data->fifo_out);
 	data->capture_rate = 1;
+#if defined(CONFIG_VIDEO_STM32U5_DCMI_LLI)
+	data->capture_uses_lli = false;
+#endif
 
 	config->irq_config(dev);
 

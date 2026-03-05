@@ -132,3 +132,14 @@ Without this logic, the DCMI completion callback would never run and captures wo
 - **Keep** the `hal_override` handling in the Zephyr repo’s `drivers/dma/dma_stm32u5.c`.
 - If that code is not yet upstream, **submit it** to the Zephyr project so it becomes part of mainline and you don’t carry a local patch.
 - **Document** for your team that this app (and this DCMI module) depend on that DMA driver behavior; no need to change or move it.
+
+---
+
+## GPDMA linked-list mode (optional, for resolutions &gt; 64KB)
+
+The GPDMA BNDT register limits a single block transfer to 65535 bytes. For larger frames (e.g. 320×240 RGB565 = 153600 bytes), the driver can use **GPDMA linked-list mode**: one frame is split into multiple nodes (each ≤ 65532 bytes), and the DMA runs through the list in one go.
+
+- **Kconfig:** `CONFIG_VIDEO_STM32U5_DCMI_LLI` (default `y`). Enables the path when `buffer_size > 65532`.
+- **Requires:** `USE_STM32_HAL_DMA_EX` and HAL APIs: `HAL_DMAEx_List_Init`, `HAL_DMAEx_List_BuildNode`, `HAL_DMAEx_List_InsertNode*`, `HAL_DMAEx_List_Start_IT`. The DMA handle must provide a queue (e.g. `hdma->LinkedList` in STM32U5 HAL).
+- **Flow:** On stream start, if the frame is large, the driver builds a linear linked list of nodes, initializes the channel for linked list, inserts the nodes, registers a completion callback, starts the list, then enables DCMI capture. When the list completes, the DMA callback stops DCMI and runs the same frame-done logic as the normal path.
+- If your HAL does not provide these APIs or the handle layout differs, set `CONFIG_VIDEO_STM32U5_DCMI_LLI=n` and keep using 160×120 or other resolutions that fit in one block.

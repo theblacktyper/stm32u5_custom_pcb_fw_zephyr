@@ -1,6 +1,6 @@
 /*
- * Person detection model (Visual Wake Words style, 96x96 grayscale).
- * Generated from person_detect.tflite from tflite-micro.
+ * Person detection model (official TFLite Micro, 96x96 grayscale).
+ * Generate with: python tools/tflite_to_c_array.py person_detect.tflite person_detect_model_data.c
  */
 #ifndef PERSON_DETECT_MODEL_DATA_H_
 #define PERSON_DETECT_MODEL_DATA_H_

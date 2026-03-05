@@ -14,3 +14,13 @@ config VIDEO_STM32U5_DCMI
 	  Out-of-tree DCMI driver for STM32U5 with GPDMA support.
 	  Requires board to use compatible "st,stm32u5-dcmi" and
 	  CONFIG_VIDEO_STM32_DCMI=n.
+
+config VIDEO_STM32U5_DCMI_LLI
+	bool "Use GPDMA linked-list for frames larger than 64KB"
+	default y
+	depends on VIDEO_STM32U5_DCMI
+	help
+	  When enabled, frames larger than 65532 bytes (e.g. 320x240 RGB565)
+	  are captured via GPDMA linked-list mode (multiple nodes per frame).
+	  Requires USE_STM32_HAL_DMA_EX. Disable if your HAL does not provide
+	  HAL_DMAEx_List_* APIs.

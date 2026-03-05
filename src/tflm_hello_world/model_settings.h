@@ -1,6 +1,6 @@
 /*
  * Person detection model settings (96x96 grayscale, 2 classes).
- * Must match the person_detect.tflite model from tflite-micro.
+ * Official TFLite Micro person_detect.tflite (MobileNet v1, VWW).
  * C-compatible (no constexpr).
  */
 #ifndef MODEL_SETTINGS_H_
