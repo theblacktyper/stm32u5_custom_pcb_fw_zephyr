@@ -8,6 +8,8 @@
  */
 
 #include <zephyr/logging/log.h>
+#include "build_version.h"
+#include "app_version.h"
 LOG_MODULE_REGISTER(kk_edge_ai, LOG_LEVEL_INF);
 
 /* Set to 1 to enable TFLM inference thread; 0 to disable for camera-only testing. */
@@ -19,6 +21,10 @@ LOG_MODULE_REGISTER(kk_edge_ai, LOG_LEVEL_INF);
 #endif
 
 #include <zephyr/kernel.h>
+#if defined(CONFIG_MCUMGR_SMP_COMMAND_STATUS_HOOKS) || defined(CONFIG_MCUMGR_GRP_IMG_STATUS_HOOKS)
+#include <zephyr/mgmt/mcumgr/mgmt/callbacks.h>
+#include <zephyr/mgmt/mcumgr/mgmt/mgmt.h>
+#endif
 #include <zephyr/drivers/display.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/video.h>
@@ -26,7 +32,6 @@ LOG_MODULE_REGISTER(kk_edge_ai, LOG_LEVEL_INF);
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
-#include <version.h>
 #include <stdbool.h>
 #include <math.h>
 #include <stdio.h>
@@ -76,7 +81,6 @@ const struct device *ov5640 = DEVICE_DT_GET(DT_NODELABEL(ov5640));
 const struct device *video_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_camera));
 
 static volatile uint8_t is_cam_capture_started = 0;
-static volatile uint8_t is_zoom_2x = 0;
 
 /*
  * Camera resolution toggle:
@@ -162,6 +166,8 @@ static int64_t fps_start_ms;
 static float fps_current;
 static float fps_last_logged = -1.0f;
 
+#define PERSON_DET_THRES_PCT 80
+
 #if ENABLE_INFERENCE
 /* Most recent frame handed off from camera_thread to inference_thread. */
 static struct video_buffer *inference_vbuf;
@@ -180,6 +186,16 @@ static bool last_frame_handed_off;
 static int8_t latest_person_score;
 static int8_t latest_no_person_score;
 #endif
+
+#if defined(CONFIG_MCUMGR_SMP_COMMAND_STATUS_HOOKS)
+/* Set when SMP command received; camera/inference pause to reduce UART contention during DFU */
+static atomic_t dfu_in_progress = ATOMIC_INIT(0);
+#endif
+
+/* DFU mode: hold SW1 for 3+ seconds; all threads halt, display shows "DFU mode", UART dedicated to mcumgr */
+#define DFU_MODE_HOLD_MS  3000
+#define DFU_MODE_POLL_MS  100
+static atomic_t dfu_mode_active = ATOMIC_INIT(0);
 
 struct led {
 	struct gpio_dt_spec spec;
@@ -203,16 +219,7 @@ static struct gpio_callback button_sec_cb_data;
 static void start_capture_work_handler(struct k_work *work);
 static K_WORK_DEFINE(start_capture_work, start_capture_work_handler);
 
-/* ---- OV5640 zoom control (1x / 2x) -------------------------------------- */
-
-#define ENABLE_ZOOM_BUTTONS 0
-
-enum ov5640_zoom_level {
-	OV5640_ZOOM_1X = 0,
-	OV5640_ZOOM_2X = 1,
-};
-
-static volatile enum ov5640_zoom_level requested_zoom = OV5640_ZOOM_1X;
+/* ---- OV5640 scaler (for 1x display) -------------------------------------- */
 
 static void ov5640_enable_scaler(void)
 {
@@ -238,71 +245,29 @@ static void ov5640_enable_scaler(void)
 	}
 }
 
-static void ov5640_set_zoom_1x(void)
-{
-	/* Application-level zoom only: sensor remains in its configured window. */
-	is_zoom_2x = 0;
-}
-
-static void ov5640_set_zoom_2x(void)
-{
-	/* Application-level zoom only: sensor remains in its configured window. */
-	is_zoom_2x = 1;
-}
-
-static void ov5640_zoom_work_handler(struct k_work *work);
-static K_WORK_DEFINE(ov5640_zoom_work, ov5640_zoom_work_handler);
-
-static void ov5640_zoom_work_handler(struct k_work *work)
-{
-	enum ov5640_zoom_level target = requested_zoom;
-
-	if (target == OV5640_ZOOM_2X && !is_zoom_2x) {
-		ov5640_set_zoom_2x();
-	} else if (target == OV5640_ZOOM_1X && is_zoom_2x) {
-		ov5640_set_zoom_1x();
-	}
-}
-
 /* Button(s) callback */
 // Button 2 (sw0)
 static void button_pressed_cb(const struct device *dev,
 			      struct gpio_callback *cb,
 			      uint32_t pins)
 {
-#if !ENABLE_ZOOM_BUTTONS
 	ARG_UNUSED(dev);
 	ARG_UNUSED(cb);
 	ARG_UNUSED(pins);
-#endif
 
 	if (!is_cam_capture_started) {
 		k_work_submit(&start_capture_work);
 	}
-#if ENABLE_ZOOM_BUTTONS
-	else {
-		/* Zoom - : request 1x when capture is running */
-		requested_zoom = OV5640_ZOOM_1X;
-		k_work_submit(&ov5640_zoom_work);
-	}
-#endif
 }
 // Button 1 (sw1)
 static void button_sec_pressed_cb(const struct device *dev,
 			      struct gpio_callback *cb,
 			      uint32_t pins)
 {
-#if !ENABLE_ZOOM_BUTTONS
 	ARG_UNUSED(dev);
 	ARG_UNUSED(cb);
 	ARG_UNUSED(pins);
-#else
-	if (is_cam_capture_started) {
-		/* Zoom + : request 2x when capture is running */
-		requested_zoom = OV5640_ZOOM_2X;
-		k_work_submit(&ov5640_zoom_work);
-	}
-#endif
+	/* SW1 used for DFU mode (hold 3s) - see dfu_mode_detector_thread */
 }
 
 /* ---- 8x16 bitmap font for printable ASCII 0x20-0x7E (VGA style) -------- */
@@ -324,6 +289,7 @@ static void button_sec_pressed_cb(const struct device *dev,
 #define COLOR_CYAN    0x0000FFFFu
 #define COLOR_MAGENTA 0x00FF00FFu
 #define COLOR_ORANGE  0x00FFA500u
+#define COLOR_GRAY   0x00808080u
 
 static const uint8_t font_ascii[95][FONT_H] = {
 	/* 0x20 ' ' */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
@@ -481,36 +447,12 @@ static inline void set_pixel_color(uint8_t *buf, uint32_t offset,
 }
 
 /**
- * Format __DATE__ and __TIME__ into "Built: YYYY-MM-DD HH:MM" (24h).
- * __DATE__ is "Mmm dd yyyy", __TIME__ is "HH:MM:SS".
+ * Format build timestamp into "Built: YYYY-MM-DD HH:MM".
+ * Uses BUILD_DATE_TIME from build_version.h (generated at build time).
  */
 static void format_build_time(char *dst, size_t size)
 {
-	static const char *const months[] = {
-		"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-		"Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
-	};
-	int month = 1;
-	for (int i = 0; i < 12; i++) {
-		if (memcmp(__DATE__, months[i], 3) == 0) {
-			month = i + 1;
-			break;
-		}
-	}
-	int day = atoi(__DATE__ + 4);
-	int year = atoi(__DATE__ + 7);
-	int h = atoi(__TIME__);
-	int m = atoi(__TIME__ + 3);
-
-	/* Clamp to valid ranges (satisfies -Wformat-truncation) */
-	if (month < 1) month = 1; else if (month > 12) month = 12;
-	if (day < 1) day = 1; else if (day > 31) day = 31;
-	if (year < 1900) year = 1900; else if (year > 9999) year = 9999;
-	if (h < 0) h = 0; else if (h > 23) h = 23;
-	if (m < 0) m = 0; else if (m > 59) m = 59;
-
-	snprintk(dst, size, "Built: %04d-%02d-%02d %02d:%02d",
-		 year, month, day, h, m);
+	snprintk(dst, size, "Built: %s", BUILD_DATE_TIME);
 }
 
 /* Return x position to center text of given pixel width on display. */
@@ -634,6 +576,39 @@ static void display_text(const struct device *dev,
 	display_write(dev, x_pos, y_pos, &desc, text_buf);
 }
 
+/**
+ * Fill the display with a solid color. Uses chunked writes to limit buffer size.
+ */
+static void fill_display_solid(const struct device *dev,
+			       const struct display_capabilities *caps,
+			       uint32_t color)
+{
+	uint8_t bpp = get_bpp(caps->current_pixel_format);
+	const size_t chunk_h = 16;
+	size_t chunk_size = caps->x_resolution * chunk_h * bpp;
+	uint8_t *chunk = k_malloc(chunk_size);
+
+	if (!chunk) {
+		return;
+	}
+	for (size_t i = 0; i < chunk_size / bpp; i++) {
+		set_pixel_color(chunk, i * bpp, caps->current_pixel_format, color);
+	}
+	struct display_buffer_descriptor desc = {
+		.buf_size = chunk_size,
+		.width  = caps->x_resolution,
+		.height = chunk_h,
+		.pitch  = caps->x_resolution,
+	};
+	for (size_t y = 0; y < caps->y_resolution; y += chunk_h) {
+		desc.height = (caps->y_resolution - y) < chunk_h ?
+			      (caps->y_resolution - y) : chunk_h;
+		desc.buf_size = desc.width * desc.height * bpp;
+		display_write(dev, 0, y, &desc, chunk);
+	}
+	k_free(chunk);
+}
+
 /* ---- Camera ---------------------------------------------------- */
 /*
  * Set one pixel in the display buffer (RGB565, DISPLAY_W x DISPLAY_H).
@@ -707,7 +682,7 @@ static void draw_person_overlay(uint8_t *dst, int8_t person_score, int8_t no_per
 	return;
 #else
 	int person_pct = clamp_pct((int)(person_score + 128) * 100 / 256);
-	int person_at_least_half = (person_pct >= 50);
+	int person_at_least_half = (person_pct >= PERSON_DET_THRES_PCT);
 	uint32_t bar_color = person_at_least_half ? COLOR_GREEN : COLOR_RED;
 
 	int x0 = FRAME_X_OFFSET;
@@ -763,13 +738,8 @@ static void draw_person_overlay(uint8_t *dst, int8_t person_score, int8_t no_per
  *
  * USE_160x120_CROP (320x240 camera): center 160x120 crop, 1:1 memcpy - no scaling.
  *
- * When CAMERA_W/H fits inside the display (e.g. 160x120 on 240x135):
- *   1x zoom -> 1:1 memcpy into the centred window.
- *   2x zoom -> crop centre half and scale up 2x with nearest-neighbor.
- *
- * When CAMERA_W/H is larger (e.g. 320x240 on 240x135, without USE_160x120_CROP):
- *   1x zoom -> nearest-neighbor downscale to FRAME_DISP_W x FRAME_DISP_H.
- *   2x zoom -> crop centre half then downscale to the same display area.
+ * When CAMERA_W/H fits inside the display: 1:1 memcpy into the centred window.
+ * When CAMERA_W/H is larger: nearest-neighbor downscale to FRAME_DISP_W x FRAME_DISP_H.
  */
 static void copy_frame_to_display(const uint8_t *src, uint8_t *dst,
 				  int8_t person_score, int8_t no_person_score)
@@ -794,48 +764,18 @@ static void copy_frame_to_display(const uint8_t *src, uint8_t *dst,
 		memcpy(dst_row, src_row, FRAME_DISP_W * sizeof(uint16_t));
 	}
 #else
-	/* Source ROI: full frame for 1x, centre half for 2x */
-	int roi_x0, roi_y0, roi_w, roi_h;
-
-	if (!is_zoom_2x) {
-		roi_x0 = 0;
-		roi_y0 = 0;
-		roi_w = CAMERA_W;
-		roi_h = CAMERA_H;
-	} else {
-		roi_w = CAMERA_W / 2;
-		roi_h = CAMERA_H / 2;
-		roi_x0 = (CAMERA_W - roi_w) / 2;
-		roi_y0 = (CAMERA_H - roi_h) / 2;
-	}
+	/* Source ROI: full frame (zoom feature removed) */
+	int roi_x0 = 0, roi_y0 = 0, roi_w = CAMERA_W, roi_h = CAMERA_H;
 
 #if (CAMERA_W <= DISPLAY_W && CAMERA_H <= DISPLAY_H)
-	/*
-	 * Camera fits on display (e.g. 160x120).
-	 * 1x: direct 1:1 copy. 2x: nearest-neighbor 2x upscale from half-ROI.
-	 */
-	if (!is_zoom_2x) {
-		for (int y = 0; y < CAMERA_H; y++) {
-			const uint16_t *src_row = s + y * CAMERA_W;
-			uint16_t *dst_row = d + (FRAME_Y_OFFSET + y) * DISPLAY_W + FRAME_X_OFFSET;
-			memcpy(dst_row, src_row, CAMERA_W * sizeof(uint16_t));
-		}
-	} else {
-		for (int dy = 0; dy < CAMERA_H; dy++) {
-			int sy = roi_y0 + (dy / 2);
-			const uint16_t *src_row = s + sy * CAMERA_W;
-			uint16_t *dst_row = d + (FRAME_Y_OFFSET + dy) * DISPLAY_W + FRAME_X_OFFSET;
-			for (int dx = 0; dx < CAMERA_W; dx++) {
-				int sx = roi_x0 + (dx / 2);
-				dst_row[dx] = src_row[sx];
-			}
-		}
+	/* Camera fits on display (e.g. 160x120): direct 1:1 copy */
+	for (int y = 0; y < CAMERA_H; y++) {
+		const uint16_t *src_row = s + y * CAMERA_W;
+		uint16_t *dst_row = d + (FRAME_Y_OFFSET + y) * DISPLAY_W + FRAME_X_OFFSET;
+		memcpy(dst_row, src_row, CAMERA_W * sizeof(uint16_t));
 	}
 #else
-	/*
-	 * Camera is larger than the display (e.g. 320x240 on 240x135).
-	 * Downscale the ROI to FRAME_DISP_W x FRAME_DISP_H with nearest-neighbor.
-	 */
+	/* Camera larger than display: downscale ROI with nearest-neighbor */
 	for (int dy = 0; dy < FRAME_DISP_H; dy++) {
 		int sy = roi_y0 + dy * roi_h / FRAME_DISP_H;
 		const uint16_t *src_row = s + sy * CAMERA_W;
@@ -935,6 +875,19 @@ void camera_thread(void)
 #endif
 
 	while (1) {
+		/* DFU mode: halt camera (hold SW1 3s to enter) */
+		if (atomic_get(&dfu_mode_active)) {
+			k_msleep(100);
+			continue;
+		}
+#if defined(CONFIG_MCUMGR_SMP_COMMAND_STATUS_HOOKS)
+		/* Pause during DFU upload to reduce UART contention with MCUmgr */
+		if (atomic_get(&dfu_in_progress)) {
+			k_msleep(100);
+			continue;
+		}
+#endif
+
 		struct video_buffer *vbuf;
 
 #if (CONFIG_VIDEO_BUFFER_POOL_NUM_MAX == 1)
@@ -967,7 +920,29 @@ void camera_thread(void)
 			continue;
 		}
 
+#if defined(CONFIG_MCUMGR_SMP_COMMAND_STATUS_HOOKS)
+		/* Poll with dfu check so we can pause within ~20ms of CMD_RECV */
+		ret = -1;
+		for (int i = 0; i < 5; i++) {
+			if (atomic_get(&dfu_in_progress)) {
+				video_stream_stop(video_dev, VIDEO_BUF_TYPE_OUTPUT);
+				{
+					struct video_buffer *tmp;
+					while (video_dequeue(video_dev, &tmp, K_NO_WAIT) == 0) {
+						video_enqueue(video_dev, tmp);
+					}
+				}
+				ret = -1;
+				break;
+			}
+			ret = video_dequeue(video_dev, &vbuf, K_MSEC(20));
+			if (ret == 0) {
+				break;
+			}
+		}
+#else
 		ret = video_dequeue(video_dev, &vbuf, K_MSEC(100));
+#endif
 		if (ret < 0) {
 			video_stream_stop(video_dev, VIDEO_BUF_TYPE_OUTPUT);
 			{
@@ -1024,7 +999,7 @@ void camera_thread(void)
 				int pct = (int)(person_score + 128) * 100 / 256;
 				if (pct < 0) pct = 0;
 				if (pct > 100) pct = 100;
-				int person_detected = (pct >= 50);
+				int person_detected = (pct >= PERSON_DET_THRES_PCT);
 				if (gpio_is_ready_dt(&led0.spec)) {
 					gpio_pin_set_dt(&led0.spec, person_detected);
 				}
@@ -1201,7 +1176,7 @@ void display_thread(void)
 		uint16_t screen_w = capabilities.x_resolution;
 
 		char version_str[32];
-		snprintk(version_str, sizeof(version_str), "Zephyr %s", KERNEL_VERSION_STRING);
+		snprintk(version_str, sizeof(version_str), "App v%s", APP_VERSION);
 
 		int vlen = strlen(version_str);
 		if (vlen > STANDBY_TEXT_MAX_LEN) {
@@ -1226,8 +1201,8 @@ void display_thread(void)
 			     text_center_x(screen_w, build_w), glyph_h + 8,
 			     COLOR_WHITE, COLOR_BLACK, text_buf, bpp, 1, 1);
 
-		/* Prompt user to press "BTN 2" */
-		const char *prompt_str = "BUTTON 2: Start";
+		/* Prompt user to press "BTN 2". For upgrade: run smpmgr BEFORE pressing. */
+		const char *prompt_str = "Button2: Start";// (smpmgr first for upgrade)";
 		uint16_t prompt_w = strlen(prompt_str) * glyph_w;
 		display_text(display_dev, &capabilities, prompt_str,
 			     text_center_x(screen_w, prompt_w), (glyph_h << 1)+16,
@@ -1236,7 +1211,43 @@ void display_thread(void)
 		LOG_WRN("Could not allocate text buffer");
 	}
 
+#if defined(CONFIG_MCUMGR_SMP_COMMAND_STATUS_HOOKS)
+	static bool updating_shown;
+#endif
 	while (1) {
+		/* DFU mode: hold SW1 3s; show banner and halt (power cycle to exit) */
+		if (atomic_get(&dfu_mode_active)) {
+			fill_display_solid(display_dev, &capabilities, COLOR_GRAY);
+			if (text_buf) {
+				display_text(display_dev, &capabilities, "DFU mode",
+					    text_center_x(capabilities.x_resolution,
+							strlen("DFU mode") * glyph_w),
+					    capabilities.y_resolution / 2 - glyph_h / 2,
+					    COLOR_RED, COLOR_GRAY, text_buf, bpp,
+					    scale_num, scale_den);
+			}
+			while (atomic_get(&dfu_mode_active)) {
+				k_msleep(1000);
+			}
+			continue;
+		}
+#if defined(CONFIG_MCUMGR_SMP_COMMAND_STATUS_HOOKS)
+		if (atomic_get(&dfu_in_progress)) {
+			if (!updating_shown && text_buf) {
+				updating_shown = true;
+				fill_display_solid(display_dev, &capabilities, COLOR_GRAY);
+				display_text(display_dev, &capabilities, "Updating Firmware",
+					    text_center_x(capabilities.x_resolution,
+							strlen("Updating Firmware") * glyph_w),
+					    capabilities.y_resolution / 2 - glyph_h / 2,
+					    COLOR_RED, COLOR_GRAY, text_buf, bpp,
+					    scale_num, scale_den);
+			}
+			k_msleep(100);
+			continue;
+		}
+		updating_shown = false;
+#endif
 		if (atomic_get(&show_camera_frame)) {
 			k_msleep(200);
 			continue;
@@ -1362,18 +1373,111 @@ static void init_usr_buttons(void)
 	gpio_add_callback(button_sec.port, &button_sec_cb_data);
 }
 
+/* Poll SW1 (button_sec); when held 3+ seconds, enter DFU mode. */
+static void dfu_mode_detector_thread(void)
+{
+	uint32_t hold_count = 0;
+	const uint32_t hold_threshold = DFU_MODE_HOLD_MS / DFU_MODE_POLL_MS;
+
+	while (1) {
+		k_msleep(DFU_MODE_POLL_MS);
+		if (!device_is_ready(button_sec.port)) {
+			continue; /* Buttons not initialized yet */
+		}
+		if (atomic_get(&dfu_mode_active)) {
+			hold_count = 0;
+			continue; /* Already in DFU mode */
+		}
+		int val = gpio_pin_get_dt(&button_sec);
+		if (val > 0) { /* Pressed (GPIO_ACTIVE_HIGH) */
+			hold_count++;
+			if (hold_count >= hold_threshold) {
+				atomic_set(&dfu_mode_active, 1);
+				hold_count = 0;
+			}
+		} else {
+			hold_count = 0;
+		}
+	}
+}
+
+#if defined(CONFIG_MCUMGR_SMP_COMMAND_STATUS_HOOKS)
+/* On CMD_RECV: reject all mcumgr/smpmgr requests unless in DFU mode (hold SW1 3s).
+ * On CMD_DONE: clear dfu_in_progress. */
+static enum mgmt_cb_return smp_cmd_cb(uint32_t event, enum mgmt_cb_return prev_status,
+				     int32_t *rc, uint16_t *group, bool *abort_more,
+				     void *data, size_t data_size)
+{
+	ARG_UNUSED(prev_status);
+	ARG_UNUSED(group);
+	ARG_UNUSED(data);
+	ARG_UNUSED(data_size);
+
+	if (event == MGMT_EVT_OP_CMD_RECV) {
+		if (!atomic_get(&dfu_mode_active)) {
+			*rc = (int32_t)MGMT_ERR_EACCESSDENIED;
+			*abort_more = true;
+			return MGMT_CB_ERROR_RC;
+		}
+		atomic_set(&dfu_in_progress, 1);
+	} else if (event == MGMT_EVT_OP_CMD_DONE) {
+		atomic_set(&dfu_in_progress, 0);
+	}
+	return MGMT_CB_OK;
+}
+
+static struct mgmt_callback smp_cmd_cb_struct;
+#endif
+
+#if defined(CONFIG_MCUMGR_GRP_IMG_STATUS_HOOKS)
+/* DFU_STARTED/DFU_STOPPED keep dfu_in_progress set for entire upload (CMD_RECV/DONE fire per-chunk). */
+static enum mgmt_cb_return img_dfu_cb(uint32_t event, enum mgmt_cb_return prev_status,
+				      int32_t *rc, uint16_t *group, bool *abort_more,
+				      void *data, size_t data_size)
+{
+	ARG_UNUSED(prev_status);
+	ARG_UNUSED(rc);
+	ARG_UNUSED(group);
+	ARG_UNUSED(abort_more);
+	ARG_UNUSED(data);
+	ARG_UNUSED(data_size);
+
+	if (event == MGMT_EVT_OP_IMG_MGMT_DFU_STARTED) {
+		atomic_set(&dfu_in_progress, 1);
+	} else if (event == MGMT_EVT_OP_IMG_MGMT_DFU_STOPPED) {
+		atomic_set(&dfu_in_progress, 0);
+	}
+	return MGMT_CB_OK;
+}
+
+static struct mgmt_callback img_dfu_cb_struct;
+#endif
+
 int main(void)
 {
 	LOG_INF("===== System Information =====");
 	// LOG_INF("Board: %s", CONFIG_BOARD);
 	// LOG_INF("Zephyr: %s", KERNEL_VERSION_STRING);
 	LOG_INF("Clock: %.2f MHz", 0.000001 * sys_clock_hw_cycles_per_sec());
-	LOG_INF("Kernel ticks/sec: %u", CONFIG_SYS_CLOCK_TICKS_PER_SEC);
+	LOG_INF("App version: %s", APP_VERSION);
 	LOG_INF("Build: " __DATE__ " " __TIME__);
 	LOG_INF("==============================\n");
 
 	init_usr_buttons();
 	init_leds();
+
+#if defined(CONFIG_MCUMGR_SMP_COMMAND_STATUS_HOOKS)
+	smp_cmd_cb_struct.callback = smp_cmd_cb;
+	smp_cmd_cb_struct.event_id = (MGMT_EVT_OP_CMD_RECV | MGMT_EVT_OP_CMD_DONE);
+	mgmt_callback_register(&smp_cmd_cb_struct);
+	LOG_INF("SMP cmd pause registered (camera/inference pause during DFU)");
+#endif
+#if defined(CONFIG_MCUMGR_GRP_IMG_STATUS_HOOKS)
+	img_dfu_cb_struct.callback = img_dfu_cb;
+	img_dfu_cb_struct.event_id = (MGMT_EVT_OP_IMG_MGMT_DFU_STARTED | MGMT_EVT_OP_IMG_MGMT_DFU_STOPPED);
+	mgmt_callback_register(&img_dfu_cb_struct);
+	LOG_INF("IMG DFU hooks registered (Updating Firmware display)");
+#endif
 
 	/* Init camera sensor + video capture (DCMI) device */
 	if (!device_is_ready(ov5640)) {
@@ -1450,9 +1554,8 @@ int main(void)
 		LOG_ERR("> Failed to set VFLIP");
 	}
 
-	/* Enable ISP scaler and apply default 1x zoom window before capture starts. */
+	/* Enable ISP scaler before capture starts. */
 	ov5640_enable_scaler();
-	ov5640_set_zoom_1x();
 
 	LOG_INF("Camera configured: RGB565 %ux%u (hflip=%d vflip=%d)\n", CAMERA_W, CAMERA_H,
 		want_hflip, want_vflip);
@@ -1483,6 +1586,25 @@ static void inference_thread(void)
 		if (vbuf == NULL) {
 			continue;
 		}
+
+		/* DFU mode: halt inference (hold SW1 3s to enter) */
+		if (atomic_get(&dfu_mode_active)) {
+			video_enqueue(video_dev, vbuf);
+#if (CONFIG_VIDEO_BUFFER_POOL_NUM_MAX == 1)
+			k_sem_give(&buffer_returned_sem);
+#endif
+			continue;
+		}
+#if defined(CONFIG_MCUMGR_SMP_COMMAND_STATUS_HOOKS)
+		/* Skip inference during DFU upload; return buffer immediately */
+		if (atomic_get(&dfu_in_progress)) {
+			video_enqueue(video_dev, vbuf);
+#if (CONFIG_VIDEO_BUFFER_POOL_NUM_MAX == 1)
+			k_sem_give(&buffer_returned_sem);
+#endif
+			continue;
+		}
+#endif
 
 		if (!tflm_person_detection_ready()) {
 			video_enqueue(video_dev, vbuf);
@@ -1522,4 +1644,6 @@ K_THREAD_DEFINE(display_id, DEFAULT_STACKSIZE, display_thread, NULL, NULL, NULL,
 // K_THREAD_DEFINE(blink1_id, DEFAULT_STACKSIZE, blink1, NULL, NULL, NULL,
 // 		PRIORITY_LED, 0, 0);
 K_THREAD_DEFINE(camera_id, CAMERA_STACKSIZE, camera_thread, NULL, NULL, NULL,
+		PRIORITY_CAMERA, 0, 0);
+K_THREAD_DEFINE(dfu_mode_detector_id, DEFAULT_STACKSIZE, dfu_mode_detector_thread, NULL, NULL, NULL,
 		PRIORITY_CAMERA, 0, 0);
