@@ -1,9 +1,9 @@
 """
 Edge AI Proto — Firmware Upload GUI
-Uses mcumgr.exe to upload firmware via MCUBoot/MCUmgr over UART.
+Uses mcumgr-client.exe (Rust) to upload firmware via MCUBoot/MCUmgr over UART.
 """
 
-import os
+import json
 import re
 import shutil
 import subprocess
@@ -20,7 +20,6 @@ from pathlib import Path
 try:
     import serial.tools.list_ports  # pyserial
 except ImportError:
-    # Show a Tk error dialog then exit
     _root = tk.Tk()
     _root.withdraw()
     messagebox.showerror(
@@ -31,14 +30,23 @@ except ImportError:
     )
     sys.exit(1)
 
-MCUMGR = shutil.which("mcumgr")
-if MCUMGR is None:
+# Look for mcumgr-client.exe bundled alongside this script, then on PATH
+SCRIPT_DIR = Path(__file__).resolve().parent
+_bundled = SCRIPT_DIR / "mcumgr-client-windows-x86" / "mcumgr-client.exe"
+if _bundled.is_file():
+    MCUMGR_CLIENT = str(_bundled)
+else:
+    MCUMGR_CLIENT = shutil.which("mcumgr-client")
+
+if MCUMGR_CLIENT is None:
     _root = tk.Tk()
     _root.withdraw()
     messagebox.showerror(
-        "mcumgr not found",
-        "mcumgr.exe is not on PATH.\n\n"
-        "Install it and make sure it is available in your system PATH.",
+        "mcumgr-client not found",
+        "mcumgr-client.exe was not found.\n\n"
+        "Expected at:\n"
+        f"  {_bundled}\n"
+        "or on system PATH.",
     )
     sys.exit(1)
 
@@ -47,11 +55,7 @@ if MCUMGR is None:
 # ---------------------------------------------------------------------------
 DEFAULT_BAUD = "921600"
 BAUD_OPTIONS = ["115200", "230400", "460800", "921600", "1000000"]
-PROGRESS_RE = re.compile(r"(\d+\.?\d*)\s*%")
-HASH_RE = re.compile(r"hash:\s*([0-9a-fA-F]+)")
-VERSION_RE = re.compile(r"version:\s*(\S+)")
-SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_FW_PATH = SCRIPT_DIR.parent / "build" / "kk_edge_ai_tflm_hello" / "zephyr" / "zephyr.signed.bin"
+DEFAULT_FW_PATH = SCRIPT_DIR.parent.parent / "build" / "kk_edge_ai_tflm_hello" / "zephyr" / "zephyr.signed.bin"
 
 
 class FwUploadApp:
@@ -61,15 +65,15 @@ class FwUploadApp:
         self.root.minsize(620, 520)
         self.root.resizable(True, True)
 
-        self._running = False  # True while a subprocess is active
+        self._running = False
         self._process: subprocess.Popen | None = None
-        self._dfu_ready = False  # True after successful DFU? check
+        self._dfu_ready = False
 
         style = ttk.Style()
         try:
             style.theme_use("vista")
         except tk.TclError:
-            pass  # fallback to default theme
+            pass
 
         self._build_ui()
         self._refresh_ports()
@@ -130,7 +134,7 @@ class FwUploadApp:
         self.upload_btn = ttk.Button(btn_frame, text="Upload", command=self._do_upload, state="disabled")
         self.upload_btn.pack(side="left", **pad)
 
-        # --- Active version label (between buttons and log) ---
+        # --- Current version label ---
         self.version_var = tk.StringVar(value="")
         self.version_label = tk.Label(
             self.root,
@@ -189,7 +193,7 @@ class FwUploadApp:
             self.file_var.set(str(DEFAULT_FW_PATH))
 
     def _browse_file(self):
-        initial_dir = str(SCRIPT_DIR.parent / "build")
+        initial_dir = str(SCRIPT_DIR.parent.parent / "build")
         if not Path(initial_dir).is_dir():
             initial_dir = str(SCRIPT_DIR)
         path = filedialog.askopenfilename(
@@ -213,7 +217,6 @@ class FwUploadApp:
     # Upload button enable/disable logic
     # ------------------------------------------------------------------
     def _update_upload_btn(self):
-        """Enable Upload only when DFU is confirmed and a file is selected."""
         if self._running:
             return
         file_ok = Path(self.file_var.get()).is_file()
@@ -228,10 +231,9 @@ class FwUploadApp:
     def _log(self, text: str, replace_last: bool = False):
         self.log_text.configure(state="normal")
         if replace_last:
-            # Delete the last line and replace
             self.log_text.delete("end-2l linestart", "end-1l lineend")
             if self.log_text.get("end-2c", "end-1c") == "\n":
-                pass  # fine
+                pass
             else:
                 self.log_text.insert("end", "\n")
         self.log_text.insert("end", text + "\n")
@@ -244,17 +246,21 @@ class FwUploadApp:
         self.log_text.configure(state="disabled")
 
     # ------------------------------------------------------------------
-    # Connection string
+    # mcumgr-client base args
     # ------------------------------------------------------------------
-    def _connstring(self) -> list[str]:
+    def _base_args(self) -> list[str]:
         port = self.port_var.get()
         baud = self.baud_var.get()
         if not port:
             raise ValueError("No COM port selected")
-        return ["--conntype=serial", f"--connstring=dev={port},baud={baud}"]
+        return [
+            MCUMGR_CLIENT,
+            "-d", port,
+            "-b", baud,
+        ]
 
     # ------------------------------------------------------------------
-    # Button state management during operations
+    # Button state management
     # ------------------------------------------------------------------
     def _set_buttons(self, enabled: bool):
         if enabled:
@@ -271,7 +277,7 @@ class FwUploadApp:
         if self._running:
             return
         try:
-            conn = self._connstring()
+            base = self._base_args()
         except ValueError as e:
             self._log(f"ERROR: {e}")
             self.status_var.set(str(e))
@@ -282,7 +288,7 @@ class FwUploadApp:
         self.status_var.set(f"{label}...")
         self._log(f"> {label}...")
 
-        cmd = [MCUMGR] + conn + args
+        cmd = base + args
 
         def _worker():
             try:
@@ -323,11 +329,11 @@ class FwUploadApp:
     # ------------------------------------------------------------------
     def _do_dfu_check(self):
         def _check_response(output: str):
-            if HASH_RE.search(output) or "slot=" in output.lower():
+            # mcumgr-client outputs JSON with "images" array
+            if '"hash"' in output or '"images"' in output:
                 self._dfu_ready = True
                 self._log("> Target is in DFU mode — firmware update can proceed.")
                 self.status_var.set("Target ready for firmware update")
-                # Extract active version from slot 0
                 self._show_active_version(output)
             else:
                 self._dfu_ready = False
@@ -343,25 +349,58 @@ class FwUploadApp:
             self.version_var.set("")
             self._update_upload_btn()
 
-        self._run_cmd(["image", "list"], "DFU?", callback=_check_response, err_callback=_on_error)
+        self._run_cmd(["list"], "DFU?", callback=_check_response, err_callback=_on_error)
 
     def _show_active_version(self, output: str):
-        """Parse slot 0 version from image list output and display it."""
-        in_slot0 = False
-        for line in output.splitlines():
-            if "slot=0" in line:
-                in_slot0 = True
-            elif "slot=1" in line:
-                in_slot0 = False
-            if in_slot0:
-                m = VERSION_RE.search(line)
-                if m:
-                    self.version_var.set(f"Current firmware: v{m.group(1)}")
-                    return
-        self.version_var.set("")
+        """Parse slot 0 version from mcumgr-client JSON output."""
+        try:
+            # Extract JSON from output (skip log lines)
+            json_start = output.find("{")
+            if json_start >= 0:
+                data = json.loads(output[json_start:])
+                for img in data.get("images", []):
+                    if img.get("slot") == 0 and img.get("active"):
+                        version = img.get("version", "")
+                        if version:
+                            self.version_var.set(f"Current firmware: v{version}")
+                            return
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+        # Fallback: regex
+        m = re.search(r'"version"\s*:\s*"([^"]+)"', output)
+        if m:
+            self.version_var.set(f"Current firmware: v{m.group(1)}")
+        else:
+            self.version_var.set("")
 
     # ------------------------------------------------------------------
-    # Upload — upload + image list + image test + reset (full sequence)
+    # Parse image list JSON for slot hashes
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_slot_hashes(output: str) -> tuple[str | None, str | None]:
+        """Extract slot 0 and slot 1 hashes from mcumgr-client JSON output."""
+        slot0_hash = None
+        slot1_hash = None
+        try:
+            json_start = output.find("{")
+            if json_start >= 0:
+                data = json.loads(output[json_start:])
+                for img in data.get("images", []):
+                    if img.get("slot") == 0:
+                        slot0_hash = img.get("hash")
+                    elif img.get("slot") == 1:
+                        slot1_hash = img.get("hash")
+        except (json.JSONDecodeError, KeyError, TypeError):
+            # Fallback: regex
+            hashes = re.findall(r'"hash"\s*:\s*"([0-9a-fA-F]+)"', output)
+            if len(hashes) >= 1:
+                slot0_hash = hashes[0]
+            if len(hashes) >= 2:
+                slot1_hash = hashes[1]
+        return slot0_hash, slot1_hash
+
+    # ------------------------------------------------------------------
+    # Upload — upload + list + test + reset (full sequence)
     # ------------------------------------------------------------------
     def _do_upload(self):
         if self._running:
@@ -372,7 +411,7 @@ class FwUploadApp:
             self.status_var.set("No firmware file selected")
             return
         try:
-            conn = self._connstring()
+            base = self._base_args()
         except ValueError as e:
             self._log(f"ERROR: {e}")
             self.status_var.set(str(e))
@@ -381,17 +420,16 @@ class FwUploadApp:
         self._running = True
         self._set_buttons(False)
         self.progress_var.set(0.0)
-        self.pct_label.configure(text="0.0%")
+        self.pct_label.configure(text="0%")
         self.status_var.set("Uploading...")
         self._log(f"> Step 1/4: Uploading {Path(fw_path).name}...")
 
-        upload_cmd = [MCUMGR, "-t", "60"] + conn + ["image", "upload", fw_path]
+        file_size = Path(fw_path).stat().st_size
+        ESTIMATED_SPEED = 31 * 1024  # ~31 KiB/s measured throughput
+        STEP_DELAY = 1.0
 
-        STEP_DELAY = 1.0  # seconds between post-upload steps
-
-        def _run_subcmd(args, timeout=30):
-            """Run an mcumgr command synchronously (called from worker thread)."""
-            cmd = [MCUMGR] + conn + args
+        def _run_subcmd(args, timeout=300):
+            cmd = base + args
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -402,33 +440,10 @@ class FwUploadApp:
             output = (result.stdout or "") + (result.stderr or "")
             return output, result.returncode
 
-        def _parse_slot_hashes(output: str) -> tuple[str | None, str | None]:
-            """Extract slot 0 and slot 1 hashes from image list output."""
-            slot0_hash = None
-            slot1_hash = None
-            current_slot = None
-            for line in output.splitlines():
-                if "slot=0" in line:
-                    current_slot = 0
-                elif "slot=1" in line:
-                    current_slot = 1
-                m = HASH_RE.search(line)
-                if m and current_slot == 0:
-                    slot0_hash = m.group(1)
-                elif m and current_slot == 1:
-                    slot1_hash = m.group(1)
-            # Fallback
-            if not slot0_hash or not slot1_hash:
-                all_hashes = HASH_RE.findall(output)
-                if len(all_hashes) >= 1 and not slot0_hash:
-                    slot0_hash = all_hashes[0]
-                if len(all_hashes) >= 2 and not slot1_hash:
-                    slot1_hash = all_hashes[1]
-            return slot0_hash, slot1_hash
-
         def _worker():
             try:
-                # --- Step 1: Upload ---
+                # --- Step 1: Upload (with estimated progress) ---
+                upload_cmd = base + ["upload", fw_path]
                 proc = subprocess.Popen(
                     upload_cmd,
                     stdout=subprocess.PIPE,
@@ -436,58 +451,43 @@ class FwUploadApp:
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
                 self._process = proc
+                start_time = time.monotonic()
 
-                buf = ""
-                last_pct_line = None
-                while True:
-                    ch = proc.stdout.read(1)
-                    if not ch:
-                        break
-                    ch = ch.decode("utf-8", errors="replace")
-                    if ch == "\r" or ch == "\n":
-                        line = buf.strip()
-                        buf = ""
-                        if not line:
-                            continue
-                        m = PROGRESS_RE.search(line)
-                        if m:
-                            pct = float(m.group(1))
-                            replace = last_pct_line is not None
-                            last_pct_line = line
-                            self.root.after(0, self._upload_progress, pct, line, replace)
-                        else:
-                            last_pct_line = None
-                            self.root.after(0, self._log, f"  {line}", False)
-                    else:
-                        buf += ch
+                # Poll process while updating estimated progress
+                while proc.poll() is None:
+                    elapsed = time.monotonic() - start_time
+                    est_pct = min(99.0, (elapsed * ESTIMATED_SPEED / file_size) * 100)
+                    self.root.after(0, self._upload_progress, est_pct, elapsed)
+                    time.sleep(0.25)
 
-                if buf.strip():
-                    self.root.after(0, self._log, f"  {buf.strip()}", False)
-
-                proc.wait()
                 rc = proc.returncode
+                output = proc.stdout.read().decode("utf-8", errors="replace")
                 self._process = None
 
+                for line in output.strip().splitlines():
+                    self.root.after(0, self._log, f"  {line}", False)
+
                 if rc != 0:
-                    self.root.after(0, self._full_upload_fail, "Upload failed (exit code {})".format(rc))
+                    self.root.after(0, self._full_upload_fail, f"Upload failed (exit code {rc})")
                     return
 
-                self.root.after(0, self._upload_progress, 100.0, "", False)
-                self.root.after(0, self._log, "> Upload complete", False)
+                elapsed = time.monotonic() - start_time
+                self.root.after(0, self._upload_progress, 100.0, elapsed)
+                self.root.after(0, self._log, f"> Upload complete ({elapsed:.0f}s)", False)
 
                 time.sleep(STEP_DELAY)
 
                 # --- Step 2: Image List ---
                 self.root.after(0, self._log, "> Step 2/4: Image List...", False)
                 self.root.after(0, lambda: self.status_var.set("Image List..."))
-                output, rc = _run_subcmd(["image", "list"])
+                output, rc = _run_subcmd(["list"])
                 for line in output.strip().splitlines():
                     self.root.after(0, self._log, f"  {line}", False)
                 if rc != 0:
                     self.root.after(0, self._full_upload_fail, f"Image List failed (exit code {rc})")
                     return
 
-                slot0_hash, slot1_hash = _parse_slot_hashes(output)
+                slot0_hash, slot1_hash = self._parse_slot_hashes(output)
                 if not slot1_hash:
                     self.root.after(0, self._full_upload_fail, "No slot 1 hash found")
                     return
@@ -503,10 +503,10 @@ class FwUploadApp:
                 # --- Step 3: Image Test ---
                 self.root.after(0, self._log, "> Step 3/4: Image Test...", False)
                 self.root.after(0, lambda: self.status_var.set("Marking image for test..."))
-                output, rc = _run_subcmd(["image", "test", slot1_hash])
+                output, rc = _run_subcmd(["test", slot1_hash])
                 for line in output.strip().splitlines():
                     self.root.after(0, self._log, f"  {line}", False)
-                if rc != 0 or "Error" in output:
+                if rc != 0:
                     self.root.after(0, self._full_upload_fail, f"Image Test failed (exit code {rc})")
                     return
 
@@ -533,16 +533,19 @@ class FwUploadApp:
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _upload_progress(self, pct: float, line: str, replace: bool):
+    def _upload_progress(self, pct: float, elapsed: float):
         self.progress_var.set(pct)
-        self.pct_label.configure(text=f"{pct:.1f}%")
-        if line:
-            self._log(f"  {line}", replace_last=replace)
-        self.status_var.set(f"Uploading... {pct:.1f}%")
+        if pct >= 100.0:
+            self.pct_label.configure(text="Done")
+        else:
+            self.pct_label.configure(text=f"~{pct:.0f}%")
+        self.status_var.set(f"Uploading... ~{pct:.0f}% ({elapsed:.0f}s)")
 
     def _full_upload_fail(self, msg: str):
         self._running = False
         self._dfu_ready = False
+        self.progress_var.set(0.0)
+        self.pct_label.configure(text="")
         self._log(f"> FAILED: {msg}")
         self.status_var.set(f"Failed: {msg}")
         self.version_var.set("")
@@ -551,6 +554,8 @@ class FwUploadApp:
     def _full_upload_done(self):
         self._running = False
         self._dfu_ready = False
+        self.progress_var.set(100.0)
+        self.pct_label.configure(text="Done")
         self._log("> All done — board is rebooting into new firmware")
         self.status_var.set("Complete — board rebooting")
         self.version_var.set("")
