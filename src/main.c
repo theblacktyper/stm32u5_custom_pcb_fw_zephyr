@@ -192,6 +192,11 @@ static int8_t latest_no_person_score;
 static atomic_t dfu_in_progress = ATOMIC_INIT(0);
 #endif
 
+#if defined(CONFIG_MCUMGR_GRP_IMG_STATUS_HOOKS)
+/* Set on DFU_STARTED; threads self-suspend permanently (device resets after FW update) */
+static atomic_t dfu_suspend_requested = ATOMIC_INIT(0);
+#endif
+
 /* DFU mode: hold SW1 for 3+ seconds; all threads halt, display shows "DFU mode", UART dedicated to mcumgr */
 #define DFU_MODE_HOLD_MS  3000
 #define DFU_MODE_POLL_MS  100
@@ -851,8 +856,14 @@ void camera_thread(void)
 	// 	CAMERA_CAPTURE_MODE_CONTINUOUS ? "continuous" : "snapshot");
 	LOG_INF("\n");
 
-	/* Wait for SW0 press before starting capture; then run until power cycle */
-	k_sem_take(&capture_sem, K_FOREVER);
+	/* Wait for SW0 press before starting capture; check for DFU periodically */
+	while (k_sem_take(&capture_sem, K_MSEC(500)) != 0) {
+#if defined(CONFIG_MCUMGR_GRP_IMG_STATUS_HOOKS)
+		if (atomic_get(&dfu_suspend_requested)) {
+			k_thread_suspend(k_current_get());
+		}
+#endif
+	}
 	if (!is_cam_capture_started) {
 		is_cam_capture_started = 1;
 	}
@@ -875,13 +886,19 @@ void camera_thread(void)
 #endif
 
 	while (1) {
+#if defined(CONFIG_MCUMGR_GRP_IMG_STATUS_HOOKS)
+		/* FW upload started: self-suspend permanently (no DMA active at loop top) */
+		if (atomic_get(&dfu_suspend_requested)) {
+			k_thread_suspend(k_current_get());
+		}
+#endif
 		/* DFU mode: halt camera (hold SW1 3s to enter) */
 		if (atomic_get(&dfu_mode_active)) {
 			k_msleep(100);
 			continue;
 		}
 #if defined(CONFIG_MCUMGR_SMP_COMMAND_STATUS_HOOKS)
-		/* Pause during DFU upload to reduce UART contention with MCUmgr */
+		/* Temporary pause for non-DFU SMP commands (image list, etc.) */
 		if (atomic_get(&dfu_in_progress)) {
 			k_msleep(100);
 			continue;
@@ -1236,9 +1253,9 @@ void display_thread(void)
 			if (!updating_shown && text_buf) {
 				updating_shown = true;
 				fill_display_solid(display_dev, &capabilities, COLOR_GRAY);
-				display_text(display_dev, &capabilities, "Updating Firmware",
+				display_text(display_dev, &capabilities, "Updating FW...",
 					    text_center_x(capabilities.x_resolution,
-							strlen("Updating Firmware") * glyph_w),
+							strlen("Updating FW...") * glyph_w),
 					    capabilities.y_resolution / 2 - glyph_h / 2,
 					    COLOR_RED, COLOR_GRAY, text_buf, bpp,
 					    scale_num, scale_den);
@@ -1381,6 +1398,11 @@ static void dfu_mode_detector_thread(void)
 
 	while (1) {
 		k_msleep(DFU_MODE_POLL_MS);
+#if defined(CONFIG_MCUMGR_GRP_IMG_STATUS_HOOKS)
+		if (atomic_get(&dfu_suspend_requested)) {
+			k_thread_suspend(k_current_get());
+		}
+#endif
 		if (!device_is_ready(button_sec.port)) {
 			continue; /* Buttons not initialized yet */
 		}
@@ -1414,14 +1436,15 @@ static enum mgmt_cb_return smp_cmd_cb(uint32_t event, enum mgmt_cb_return prev_s
 	ARG_UNUSED(data_size);
 
 	if (event == MGMT_EVT_OP_CMD_RECV) {
-		if (!atomic_get(&dfu_mode_active)) {
-			*rc = (int32_t)MGMT_ERR_EACCESSDENIED;
-			*abort_more = true;
-			return MGMT_CB_ERROR_RC;
-		}
 		atomic_set(&dfu_in_progress, 1);
 	} else if (event == MGMT_EVT_OP_CMD_DONE) {
-		atomic_set(&dfu_in_progress, 0);
+#if defined(CONFIG_MCUMGR_GRP_IMG_STATUS_HOOKS)
+		/* Once FW upload started, keep threads paused permanently */
+		if (!atomic_get(&dfu_suspend_requested))
+#endif
+		{
+			atomic_set(&dfu_in_progress, 0);
+		}
 	}
 	return MGMT_CB_OK;
 }
@@ -1444,9 +1467,14 @@ static enum mgmt_cb_return img_dfu_cb(uint32_t event, enum mgmt_cb_return prev_s
 
 	if (event == MGMT_EVT_OP_IMG_MGMT_DFU_STARTED) {
 		atomic_set(&dfu_in_progress, 1);
-	} else if (event == MGMT_EVT_OP_IMG_MGMT_DFU_STOPPED) {
-		atomic_set(&dfu_in_progress, 0);
+		atomic_set(&dfu_suspend_requested, 1);
+#if ENABLE_INFERENCE
+		/* Wake inference thread so it can self-suspend (may be blocked on semaphore) */
+		k_sem_give(&inference_frame_ready_sem);
+#endif
 	}
+	/* DFU_STOPPED: keep threads suspended; device resets after FW update.
+	 * On upload failure, user power-cycles. */
 	return MGMT_CB_OK;
 }
 
@@ -1572,6 +1600,12 @@ static void inference_thread(void)
 	tflm_person_detection_setup();
 
 	while (1) {
+#if defined(CONFIG_MCUMGR_GRP_IMG_STATUS_HOOKS)
+		/* Check before blocking on semaphore — camera may already be suspended */
+		if (atomic_get(&dfu_suspend_requested)) {
+			k_thread_suspend(k_current_get());
+		}
+#endif
 		k_sem_take(&inference_frame_ready_sem, K_FOREVER);
 
 		struct video_buffer *vbuf = NULL;
@@ -1587,6 +1621,16 @@ static void inference_thread(void)
 			continue;
 		}
 
+#if defined(CONFIG_MCUMGR_GRP_IMG_STATUS_HOOKS)
+		/* FW upload started: return buffer, then self-suspend permanently */
+		if (atomic_get(&dfu_suspend_requested)) {
+			video_enqueue(video_dev, vbuf);
+#if (CONFIG_VIDEO_BUFFER_POOL_NUM_MAX == 1)
+			k_sem_give(&buffer_returned_sem);
+#endif
+			k_thread_suspend(k_current_get());
+		}
+#endif
 		/* DFU mode: halt inference (hold SW1 3s to enter) */
 		if (atomic_get(&dfu_mode_active)) {
 			video_enqueue(video_dev, vbuf);
@@ -1596,7 +1640,7 @@ static void inference_thread(void)
 			continue;
 		}
 #if defined(CONFIG_MCUMGR_SMP_COMMAND_STATUS_HOOKS)
-		/* Skip inference during DFU upload; return buffer immediately */
+		/* Temporary pause for non-DFU SMP commands */
 		if (atomic_get(&dfu_in_progress)) {
 			video_enqueue(video_dev, vbuf);
 #if (CONFIG_VIDEO_BUFFER_POOL_NUM_MAX == 1)
