@@ -44,6 +44,14 @@ target_include_directories(app PRIVATE
 )
 
 target_sources(app PRIVATE src/main.c)
+target_sources(app PRIVATE src/esp_shell.c)
+target_sources(app PRIVATE src/wifi_autoconnect.c)
+
+# ESP-AT driver private headers (needed by esp_shell.c for esp_cmd_send / esp_driver_data)
+target_include_directories(app PRIVATE
+  ${ZEPHYR_BASE}/drivers/wifi/esp_at
+  ${ZEPHYR_BASE}/drivers/modem
+)
 target_sources(app PRIVATE
   src/tflm_hello_world/model_settings.c
   src/tflm_hello_world/person_detect_model_data.c

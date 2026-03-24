@@ -10,7 +10,7 @@
 #include <zephyr/logging/log.h>
 #include "build_version.h"
 #include "app_version.h"
-LOG_MODULE_REGISTER(kk_edge_ai, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 /* Set to 1 to enable TFLM inference thread; 0 to disable for camera-only testing. */
 #define ENABLE_INFERENCE  1

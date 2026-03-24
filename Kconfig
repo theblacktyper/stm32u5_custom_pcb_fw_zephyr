@@ -1,0 +1,56 @@
+mainmenu "Edge AI Hello World"
+
+source "Kconfig.zephyr"
+
+menu "WiFi auto-connect"
+
+config WIFI_AUTOCONNECT
+	bool "Auto-connect to WiFi on boot"
+	default y
+	depends on WIFI_ESP_AT
+	help
+	  Automatically connect to the configured WiFi network at startup.
+	  The connection attempt runs in a background thread so it does not
+	  block camera, display, or inference.
+
+config WIFI_AUTOCONNECT_SSID
+	string "Primary WiFi SSID"
+	default ""
+	depends on WIFI_AUTOCONNECT
+	help
+	  SSID of the primary WiFi network to connect to on boot.
+
+config WIFI_AUTOCONNECT_PSK
+	string "Primary WiFi passphrase (WPA2-PSK)"
+	default ""
+	depends on WIFI_AUTOCONNECT
+	help
+	  WPA2-PSK passphrase for the primary WiFi network.
+	  Leave empty for open networks.
+
+config WIFI_AUTOCONNECT_SSID2
+	string "Secondary WiFi SSID"
+	default ""
+	depends on WIFI_AUTOCONNECT
+	help
+	  SSID of a secondary WiFi network.  If the primary network is
+	  not reachable, the auto-connect routine will try this one.
+	  Leave empty to disable the secondary network.
+
+config WIFI_AUTOCONNECT_PSK2
+	string "Secondary WiFi passphrase (WPA2-PSK)"
+	default ""
+	depends on WIFI_AUTOCONNECT
+	help
+	  WPA2-PSK passphrase for the secondary WiFi network.
+	  Leave empty for open networks.
+
+config WIFI_AUTOCONNECT_RETRY_TIMEOUT_S
+	int "Connection retry timeout (seconds)"
+	default 60
+	depends on WIFI_AUTOCONNECT
+	help
+	  How long to keep retrying the WiFi connection before giving up.
+	  Set to 0 to try only once.
+
+endmenu
