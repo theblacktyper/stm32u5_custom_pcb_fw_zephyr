@@ -6,6 +6,6 @@
 #ifndef APP_VERSION_H
 #define APP_VERSION_H
 
-#define APP_VERSION "1.0.1"
+#define APP_VERSION "1.1.0"  /*v1.1.x: LVGL integration*/
 
 #endif /* APP_VERSION_H */

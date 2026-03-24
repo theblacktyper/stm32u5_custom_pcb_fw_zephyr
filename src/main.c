@@ -26,6 +26,7 @@ LOG_MODULE_REGISTER(kk_edge_ai, LOG_LEVEL_INF);
 #include <zephyr/mgmt/mcumgr/mgmt/mgmt.h>
 #endif
 #include <zephyr/drivers/display.h>
+#include <lvgl.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/video.h>
 #include <zephyr/drivers/video-controls.h>
@@ -40,6 +41,7 @@ LOG_MODULE_REGISTER(kk_edge_ai, LOG_LEVEL_INF);
 
 /* size of stack area used by threads */
 #define DEFAULT_STACKSIZE    1024
+#define DISPLAY_STACKSIZE    4096
 #define INFERENCE_STACKSIZE  4096
 #define CAMERA_STACKSIZE     8192
 
@@ -1066,16 +1068,9 @@ void camera_thread(void)
 
 void display_thread(void)
 {
-	size_t rect_w;
-	size_t rect_h;
-	size_t h_step;
-	size_t scale;
-	uint8_t *buf;
 	int32_t grey_scale_sleep;
 	const struct device *display_dev;
 	struct display_capabilities capabilities;
-	struct display_buffer_descriptor buf_desc;
-	size_t buf_size = 0;
 
 	display_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_display));
 	if (!device_is_ready(display_dev)) {
@@ -1084,31 +1079,7 @@ void display_thread(void)
 		return;
 	}
 
-	// LOG_INF("Display %s Thread Starts", display_dev->name);
 	display_get_capabilities(display_dev, &capabilities);
-
-	if (capabilities.screen_info & SCREEN_INFO_MONO_VTILED) {
-		rect_w = 16;
-		rect_h = 8;
-	} else {
-		rect_w = 2;
-		rect_h = 1;
-	}
-
-	if ((capabilities.x_resolution < 3 * rect_w) ||
-	    (capabilities.y_resolution < 3 * rect_h) ||
-	    (capabilities.x_resolution < 8 * rect_h)) {
-		rect_w = capabilities.x_resolution * 40 / 100;
-		rect_h = capabilities.y_resolution * 40 / 100;
-		h_step = capabilities.y_resolution * 20 / 100;
-		scale = 1;
-	} else {
-		h_step = rect_h;
-		scale = (capabilities.x_resolution / 8) / rect_h;
-	}
-
-	rect_w *= scale;
-	rect_h *= scale;
 
 	if (capabilities.screen_info & SCREEN_INFO_EPD) {
 		grey_scale_sleep = 10000;
@@ -1116,117 +1087,52 @@ void display_thread(void)
 		grey_scale_sleep = 100;
 	}
 
-	if (capabilities.screen_info & SCREEN_INFO_X_ALIGNMENT_WIDTH) {
-		rect_w = capabilities.x_resolution;
-	}
+	/* ---- LVGL startup screen ---- */
+	lv_obj_t *scr = lv_scr_act();
+	lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+	lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-	buf_size = rect_w * rect_h;
+	/* App version label (orange, top center) */
+	char version_str[32];
+	snprintk(version_str, sizeof(version_str), "App v%s", APP_VERSION);
 
-	if (buf_size < (capabilities.x_resolution * h_step)) {
-		buf_size = capabilities.x_resolution * h_step;
-	}
+	lv_obj_t *lbl_version = lv_label_create(scr);
+	lv_label_set_text(lbl_version, version_str);
+	lv_obj_set_style_text_color(lbl_version, lv_color_make(0xFF, 0xA5, 0x00), 0);
+	lv_obj_set_style_text_font(lbl_version, &lv_font_montserrat_22, 0);
+	lv_obj_align(lbl_version, LV_ALIGN_TOP_MID, 0, 4);
 
-	switch (capabilities.current_pixel_format) {
-	case PIXEL_FORMAT_ARGB_8888:
-		buf_size *= 4;
-		break;
-	case PIXEL_FORMAT_RGB_888:
-		buf_size *= 3;
-		break;
-	case PIXEL_FORMAT_RGB_565:
-	case PIXEL_FORMAT_BGR_565:
-		buf_size *= 2;
-		break;
-	case PIXEL_FORMAT_L_8:
-		break;
-	case PIXEL_FORMAT_MONO01:
-	case PIXEL_FORMAT_MONO10:
-		buf_size = DIV_ROUND_UP(DIV_ROUND_UP(
-			buf_size, NUM_BITS(uint8_t)), sizeof(uint8_t));
-		break;
-	default:
-		LOG_ERR("Unsupported pixel format. Aborting sample.");
- 		return;
-	}
+	/* Build date/time label (white, below version) */
+	char build_str[64];
+	format_build_time(build_str, sizeof(build_str));
 
-	buf = k_malloc(buf_size);
+	lv_obj_t *lbl_build = lv_label_create(scr);
+	lv_label_set_text(lbl_build, build_str);
+	lv_obj_set_style_text_color(lbl_build, lv_color_white(), 0);
+	lv_obj_set_style_text_font(lbl_build, &lv_font_montserrat_16, 0);
+	lv_obj_align_to(lbl_build, lbl_version, LV_ALIGN_OUT_BOTTOM_MID, 0, 6);
 
-	if (buf == NULL) {
-		LOG_ERR("Could not allocate memory. Aborting sample.");
- 		return;
-	}
+	/* Button prompt label (yellow on blue bg, below build) */
+	lv_obj_t *lbl_prompt = lv_label_create(scr);
+	lv_label_set_text(lbl_prompt, "Button2: Start");
+	lv_obj_set_style_text_color(lbl_prompt, lv_color_make(0xFF, 0xFF, 0x00), 0);
+	lv_obj_set_style_text_font(lbl_prompt, &lv_font_montserrat_18, 0);
+	lv_obj_set_style_bg_color(lbl_prompt, lv_color_make(0x00, 0x00, 0xFF), 0);
+	lv_obj_set_style_bg_opa(lbl_prompt, LV_OPA_COVER, 0);
+	lv_obj_set_style_pad_all(lbl_prompt, 4, 0);
+	lv_obj_align_to(lbl_prompt, lbl_build, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
 
-	/* Black background fill */
-	(void)memset(buf, 0, buf_size);
-
-	buf_desc.buf_size = buf_size;
-	buf_desc.pitch = capabilities.x_resolution;
-	buf_desc.width = capabilities.x_resolution;
-	buf_desc.height = h_step;
-	buf_desc.frame_incomplete = true;
-
-	for (int idx = 0; idx < capabilities.y_resolution; idx += h_step) {
-		if ((capabilities.y_resolution - idx) < h_step) {
-			buf_desc.height = (capabilities.y_resolution - idx);
-		}
-		display_write(display_dev, 0, idx, &buf_desc, buf);
-	}
-
-	buf_desc.frame_incomplete = false;
 	display_blanking_off(display_dev);
+	lv_task_handler();
 
-	k_free(buf);
-	buf = NULL;
-
-	/* Text rendering: Zephyr version (top center, orange) + build date/time (below, white) */
+	/* ---- Allocate text_buf for DFU/update screens (raw drawing) ---- */
 	uint8_t bpp = get_bpp(capabilities.current_pixel_format);
-	/* 1.5x scale: 12x24 glyphs (was 2x = 16x32) */
 	int scale_num = FONT_SCALE_LARGE_NUM;
 	int scale_den = FONT_SCALE_LARGE_DEN;
 	uint16_t glyph_w = FONT_W * scale_num / scale_den;
 	uint16_t glyph_h = FONT_H * scale_num / scale_den;
-	/* Buffer sized for longest string we draw (version ~20 chars, build ~24 chars) */
 	uint32_t text_buf_size = STANDBY_TEXT_MAX_LEN * glyph_w * glyph_h * bpp;
 	uint8_t *text_buf = k_malloc(text_buf_size);
-
-	if (text_buf) {
-		uint16_t screen_w = capabilities.x_resolution;
-
-		char version_str[32];
-		snprintk(version_str, sizeof(version_str), "App v%s", APP_VERSION);
-
-		int vlen = strlen(version_str);
-		if (vlen > STANDBY_TEXT_MAX_LEN) {
-			version_str[STANDBY_TEXT_MAX_LEN] = '\0';
-			vlen = STANDBY_TEXT_MAX_LEN;
-		}
-		uint16_t version_w = vlen * glyph_w;
-		display_text(display_dev, &capabilities, version_str,
-			     text_center_x(screen_w, version_w), 0, COLOR_ORANGE, COLOR_BLACK,
-			     text_buf, bpp, scale_num, scale_den);
-
-		/* Build date/time: "Built: YYYY-MM-DD HH:MM" (24h) */
-		char build_str[64];
-		format_build_time(build_str, sizeof(build_str));
-		int blen = strlen(build_str);
-		if (blen > STANDBY_TEXT_MAX_LEN) {
-			build_str[STANDBY_TEXT_MAX_LEN] = '\0';
-			blen = STANDBY_TEXT_MAX_LEN;
-		}
-		uint16_t build_w = blen * FONT_W;  /* scale 1 for build line */
-		display_text(display_dev, &capabilities, build_str,
-			     text_center_x(screen_w, build_w), glyph_h + 8,
-			     COLOR_WHITE, COLOR_BLACK, text_buf, bpp, 1, 1);
-
-		/* Prompt user to press "BTN 2". For upgrade: run smpmgr BEFORE pressing. */
-		const char *prompt_str = "Button2: Start";// (smpmgr first for upgrade)";
-		uint16_t prompt_w = strlen(prompt_str) * glyph_w;
-		display_text(display_dev, &capabilities, prompt_str,
-			     text_center_x(screen_w, prompt_w), (glyph_h << 1)+16,
-			     COLOR_YELLOW, COLOR_BLUE, text_buf, bpp, scale_num, scale_den);
-	} else {
-		LOG_WRN("Could not allocate text buffer");
-	}
 
 #if defined(CONFIG_MCUMGR_SMP_COMMAND_STATUS_HOOKS)
 	static bool updating_shown;
@@ -1681,7 +1587,7 @@ static void inference_thread(void)
 K_THREAD_DEFINE(inference_id, INFERENCE_STACKSIZE, inference_thread, NULL, NULL, NULL,
 		PRIORITY_CAMERA, 0, 0);
 #endif /* ENABLE_INFERENCE */
-K_THREAD_DEFINE(display_id, DEFAULT_STACKSIZE, display_thread, NULL, NULL, NULL,
+K_THREAD_DEFINE(display_id, DISPLAY_STACKSIZE, display_thread, NULL, NULL, NULL,
 		PRIORITY_CAMERA, 0, 0);
 // K_THREAD_DEFINE(blink0_id, DEFAULT_STACKSIZE, blink0, NULL, NULL, NULL,
 // 		PRIORITY_LED, 0, 0);
