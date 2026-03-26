@@ -192,7 +192,7 @@ static void wifi_autoconnect_thread(void *p1, void *p2, void *p3)
 	LOG_WRN("Gave up WiFi auto-connect after %d round(s)", attempt);
 }
 
-#define WIFI_AUTOCONNECT_STACKSIZE 2048
+#define WIFI_AUTOCONNECT_STACKSIZE 1024
 #define WIFI_AUTOCONNECT_PRIORITY  14
 
 K_THREAD_DEFINE(wifi_autoconnect_id, WIFI_AUTOCONNECT_STACKSIZE,

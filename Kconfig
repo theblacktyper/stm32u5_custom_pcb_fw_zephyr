@@ -2,6 +2,18 @@ mainmenu "Edge AI Hello World"
 
 source "Kconfig.zephyr"
 
+menu "Application options"
+
+config APP_ENABLE_INFERENCE
+	bool "Enable camera inference thread"
+	default y
+	depends on TENSORFLOW_LITE_MICRO
+	help
+	  Enables TensorFlow Lite Micro inference processing and starts the
+	  inference runtime thread. Disable this for camera/display-only runs.
+
+endmenu
+
 menu "WiFi auto-connect"
 
 config WIFI_AUTOCONNECT

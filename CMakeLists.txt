@@ -44,6 +44,15 @@ target_include_directories(app PRIVATE
 )
 
 target_sources(app PRIVATE src/main.c)
+target_sources(app PRIVATE src/app_runtime.c)
+target_sources(app PRIVATE src/camera_pipeline.c)
+target_sources(app PRIVATE src/camera_runtime.c)
+target_sources(app PRIVATE src/dfu_state.c)
+target_sources(app PRIVATE src/display_text.c)
+target_sources(app PRIVATE src/display_overlay.c)
+target_sources(app PRIVATE src/display_screen.c)
+target_sources(app PRIVATE src/input_buttons.c)
+target_sources(app PRIVATE src/status_led.c)
 target_sources(app PRIVATE src/esp_shell.c)
 target_sources(app PRIVATE src/wifi_autoconnect.c)
 

@@ -6,6 +6,6 @@
 #ifndef APP_VERSION_H
 #define APP_VERSION_H
 
-#define APP_VERSION "2.0.2"  /* v2.x.x : ESP Wi-Fi + all features from v1 (except LVGL) */
+#define APP_VERSION "2.2.0"  /* v2.2.x : Major refactoring + all features from v2.0.x */
 
 #endif /* APP_VERSION_H */
