@@ -26,5 +26,7 @@ void display_screen_render_dfu_mode(const struct device *display_dev,
 void display_screen_render_updating(const struct device *display_dev,
 				    const struct display_capabilities *capabilities,
 				    const struct display_screen_ctx *ctx);
+/** Call when entering or leaving the FW-updating screen so static paint state resets. */
+void display_screen_updating_invalidate(void);
 
 #endif /* DISPLAY_SCREEN_H_ */

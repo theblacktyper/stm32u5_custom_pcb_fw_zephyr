@@ -20,6 +20,8 @@ void display_text(const struct device *dev, const struct display_capabilities *c
 		  int scale_num, int scale_den);
 void fill_display_solid(const struct device *dev,
 			const struct display_capabilities *caps, uint32_t color);
+void display_solid_rect(const struct device *dev, const struct display_capabilities *caps,
+			uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color);
 const uint8_t *display_glyph_for_char(char ch);
 
 #endif /* DISPLAY_TEXT_H_ */

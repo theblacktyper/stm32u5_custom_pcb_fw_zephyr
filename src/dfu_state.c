@@ -15,6 +15,10 @@ static struct mgmt_callback smp_cmd_cb_struct;
 static atomic_t dfu_suspend_requested = ATOMIC_INIT(0);
 static struct mgmt_callback img_dfu_cb_struct;
 #endif
+#if defined(CONFIG_GOLIOTH_OTA)
+static atomic_t dfu_cloud_ota = ATOMIC_INIT(0);
+static atomic_t dfu_cloud_ota_fw_screen = ATOMIC_INIT(0);
+#endif
 
 #if defined(CONFIG_MCUMGR_SMP_COMMAND_STATUS_HOOKS)
 static enum mgmt_cb_return smp_cmd_cb(uint32_t event, enum mgmt_cb_return prev_status,
@@ -60,6 +64,12 @@ static enum mgmt_cb_return img_dfu_cb(uint32_t event, enum mgmt_cb_return prev_s
 #endif
 		atomic_set(&dfu_suspend_requested, 1);
 		camera_wake_inference_thread();
+	} else if (event == MGMT_EVT_OP_IMG_MGMT_DFU_STOPPED) {
+		atomic_set(&dfu_suspend_requested, 0);
+#if defined(CONFIG_MCUMGR_SMP_COMMAND_STATUS_HOOKS)
+		atomic_set(&dfu_in_progress, 0);
+#endif
+		camera_wake_inference_thread();
 	}
 	return MGMT_CB_OK;
 }
@@ -88,6 +98,11 @@ bool dfu_is_mode_active(void)
 
 bool dfu_is_in_progress(void)
 {
+#if defined(CONFIG_GOLIOTH_OTA)
+	if (atomic_get(&dfu_cloud_ota) != 0) {
+		return true;
+	}
+#endif
 #if defined(CONFIG_MCUMGR_SMP_COMMAND_STATUS_HOOKS)
 	return atomic_get(&dfu_in_progress) != 0;
 #else
@@ -97,6 +112,11 @@ bool dfu_is_in_progress(void)
 
 bool dfu_should_suspend(void)
 {
+#if defined(CONFIG_GOLIOTH_OTA)
+	if (atomic_get(&dfu_cloud_ota) != 0) {
+		return true;
+	}
+#endif
 #if defined(CONFIG_MCUMGR_GRP_IMG_STATUS_HOOKS)
 	return atomic_get(&dfu_suspend_requested) != 0;
 #else
@@ -108,3 +128,39 @@ void dfu_set_mode_active(bool active)
 {
 	atomic_set(&dfu_mode_active, active ? 1 : 0);
 }
+
+bool dfu_show_fw_updating_screen(void)
+{
+#if defined(CONFIG_MCUMGR_GRP_IMG_STATUS_HOOKS)
+	if (atomic_get(&dfu_suspend_requested) != 0 && atomic_get(&dfu_mode_active) != 0) {
+		return true;
+	}
+#endif
+#if defined(CONFIG_GOLIOTH_OTA)
+	if (atomic_get(&dfu_cloud_ota_fw_screen) != 0) {
+		return true;
+	}
+#endif
+	return false;
+}
+
+#if defined(CONFIG_GOLIOTH_OTA)
+void dfu_cloud_ota_set_active(bool active)
+{
+	atomic_set(&dfu_cloud_ota, active ? 1 : 0);
+	if (!active) {
+		atomic_set(&dfu_cloud_ota_fw_screen, 0);
+	}
+	if (active) {
+		camera_wake_inference_thread();
+	}
+}
+
+void dfu_cloud_ota_fw_screen_set(bool active)
+{
+	atomic_set(&dfu_cloud_ota_fw_screen, active ? 1 : 0);
+	if (active) {
+		camera_wake_inference_thread();
+	}
+}
+#endif

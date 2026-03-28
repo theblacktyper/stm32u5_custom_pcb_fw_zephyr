@@ -25,6 +25,10 @@ west build -b <your_board> -- -DBOARD_ROOT=$(pwd)
 west build -b <your_board> kk_edge_ai_tflm_hello
 ```
 
+## Golioth cloud OTA
+
+The Golioth Firmware SDK is expected under `modules/golioth-firmware-sdk` (see [west.yml](west.yml)). Setup, credentials, artifact path, and Console steps are documented in [docs/GOLIOTH_OTA.md](docs/GOLIOTH_OTA.md).
+
 ## Board requirements
 
 - Display (chosen via `zephyr,display`)

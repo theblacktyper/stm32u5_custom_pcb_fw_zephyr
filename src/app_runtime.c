@@ -9,6 +9,9 @@
 #include "dfu_state.h"
 #include "display_screen.h"
 #include "input_buttons.h"
+#if defined(CONFIG_GOLIOTH_OTA)
+#include "golioth_ui.h"
+#endif
 
 LOG_MODULE_DECLARE(main, LOG_LEVEL_INF);
 
@@ -18,9 +21,13 @@ LOG_MODULE_DECLARE(main, LOG_LEVEL_INF);
 #define CAMERA_STACKSIZE     1536
 #define DFU_DETECTOR_STACKSIZE 512
 
-/* scheduling priority: lower number = higher priority in Zephyr */
-#define EQUAL_PRIORITY    7
-#define PRIORITY_CAMERA   EQUAL_PRIORITY
+/*
+ * Priorities: lower number = higher priority (preempts higher numbers).
+ * ESP-AT defaults RX + workq to priority 7 — same as camera was, so four app threads
+ * (camera/display/inference/DFU) time-sliced with WiFi I/O and starved the link →
+ * -ETIMEDOUT / send failures once TFLM + capture run. Keep multimedia below WiFi driver.
+ */
+#define PRIORITY_CAMERA   11
 
 static void display_thread(void)
 {
@@ -43,10 +50,34 @@ static void display_thread(void)
 		LOG_WRN("Could not render boot text");
 	}
 
-#if defined(CONFIG_MCUMGR_SMP_COMMAND_STATUS_HOOKS)
-	static bool updating_shown;
+#if defined(CONFIG_GOLIOTH_OTA)
+	unsigned standby_phase_prev = golioth_ui_standby_phase_id();
 #endif
+
 	while (1) {
+#if defined(CONFIG_MCUMGR_SMP_COMMAND_STATUS_HOOKS) || defined(CONFIG_GOLIOTH_OTA)
+		/* "Updating Firmware": wired SMP image + SW1 DFU mode, or cloud OTA from first block onward.
+		 * Re-render when progress changes; invalidate on enter/leave so static paint state resets.
+		 */
+		{
+			static bool display_prev_updating;
+			const bool now_updating = dfu_show_fw_updating_screen();
+
+			if (now_updating != display_prev_updating) {
+				display_screen_updating_invalidate();
+			}
+			display_prev_updating = now_updating;
+
+			if (now_updating) {
+				if (screen_ctx.text_buf) {
+					display_screen_render_updating(display_dev, &capabilities,
+								       &screen_ctx);
+				}
+				k_msleep(100);
+				continue;
+			}
+		}
+#endif
 		if (dfu_is_mode_active()) {
 			display_screen_render_dfu_mode(display_dev, &capabilities, &screen_ctx);
 			while (dfu_is_mode_active()) {
@@ -54,23 +85,30 @@ static void display_thread(void)
 			}
 			continue;
 		}
-#if defined(CONFIG_MCUMGR_SMP_COMMAND_STATUS_HOOKS)
-		if (dfu_is_in_progress()) {
-			if (!updating_shown && screen_ctx.text_buf) {
-				updating_shown = true;
-				display_screen_render_updating(display_dev, &capabilities, &screen_ctx);
-			}
-			k_msleep(100);
-			continue;
-		}
-		updating_shown = false;
-#endif
 		if (camera_is_showing_frame()) {
 			k_msleep(200);
 			continue;
 		}
 
+#if defined(CONFIG_GOLIOTH_OTA)
+		{
+			const unsigned p = golioth_ui_standby_phase_id();
+
+			if (p != standby_phase_prev) {
+				standby_phase_prev = p;
+				if (screen_ctx.text_buf) {
+					display_screen_render_boot(display_dev, &capabilities, &screen_ctx);
+				}
+			}
+			if (p == GOLIOTH_UI_STANDBY_PHASE_BUTTON2) {
+				k_msleep(screen_ctx.grey_scale_sleep);
+			} else {
+				k_msleep(200);
+			}
+		}
+#else
 		k_msleep(screen_ctx.grey_scale_sleep);
+#endif
 	}
 }
 

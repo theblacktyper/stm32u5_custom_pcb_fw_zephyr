@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 cmake_minimum_required(VERSION 3.20.0)
-# Ensure out-of-tree STM32U5 DCMI module is loaded (required for st,stm32u5-dcmi)
+# Out-of-tree modules: STM32U5 DCMI driver + Golioth Firmware SDK (see west.yml and docs/GOLIOTH_OTA.md)
+set(_zephyr_extra_modules "${CMAKE_CURRENT_SOURCE_DIR}/modules/stm32u5_dcmi")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/modules/golioth-firmware-sdk/zephyr/module.yml")
+  set(_zephyr_extra_modules "${_zephyr_extra_modules};${CMAKE_CURRENT_SOURCE_DIR}/modules/golioth-firmware-sdk")
+endif()
 if(NOT ZEPHYR_EXTRA_MODULES)
-  set(ZEPHYR_EXTRA_MODULES "${CMAKE_CURRENT_SOURCE_DIR}/modules/stm32u5_dcmi" CACHE STRING "Extra Zephyr modules")
+  set(ZEPHYR_EXTRA_MODULES "${_zephyr_extra_modules}" CACHE STRING "Extra Zephyr modules")
 endif()
 
 # Read APP_VERSION from app_version.h and pass to imgtool for MCUboot signing
@@ -55,6 +59,7 @@ target_sources(app PRIVATE src/input_buttons.c)
 target_sources(app PRIVATE src/status_led.c)
 target_sources(app PRIVATE src/esp_shell.c)
 target_sources(app PRIVATE src/wifi_autoconnect.c)
+target_sources(app PRIVATE src/wifi_link.c)
 
 # ESP-AT driver private headers (needed by esp_shell.c for esp_cmd_send / esp_driver_data)
 target_include_directories(app PRIVATE
@@ -72,3 +77,18 @@ target_include_directories(app PRIVATE src/tflm_hello_world)
 
 # TFLM hello_world uses local static init; disable thread-safe statics for C++
 zephyr_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-threadsafe-statics>)
+
+if(CONFIG_GOLIOTH_OTA)
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/modules/golioth-firmware-sdk/zephyr/module.yml")
+    message(FATAL_ERROR "Golioth Firmware SDK not found. Clone v0.22.0 into modules/golioth-firmware-sdk (see docs/GOLIOTH_OTA.md).")
+  endif()
+  target_sources(app PRIVATE
+    src/golioth_ota.c
+    src/golioth_ui.c
+    src/ota_download_ui.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/modules/golioth-firmware-sdk/examples/zephyr/fw_update/src/fw_update.c
+  )
+  target_include_directories(app PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/modules/golioth-firmware-sdk/examples/zephyr/fw_update/src
+  )
+endif()

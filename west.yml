@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Merge this project into your Zephyr workspace west.yml under `projects:`, or
+# use it as a supplemental manifest (see docs/GOLIOTH_OTA.md).
+#
+manifest:
+  version: "0.13"
+  remotes:
+    - name: golioth
+      url-base: https://github.com/golioth
+  projects:
+    - name: golioth-firmware-sdk
+      path: modules/golioth-firmware-sdk
+      remote: golioth
+      revision: v0.22.0

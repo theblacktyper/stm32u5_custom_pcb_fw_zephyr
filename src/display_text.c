@@ -281,3 +281,35 @@ void fill_display_solid(const struct device *dev, const struct display_capabilit
 	}
 	k_free(chunk);
 }
+
+void display_solid_rect(const struct device *dev, const struct display_capabilities *caps,
+			uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t color)
+{
+	if (w == 0U || h == 0U) {
+		return;
+	}
+	if ((uint32_t)x + (uint32_t)w > caps->x_resolution || (uint32_t)y + (uint32_t)h > caps->y_resolution) {
+		return;
+	}
+
+	uint8_t bpp = get_bpp(caps->current_pixel_format);
+	size_t pixels = (size_t)w * (size_t)h;
+	size_t buf_sz = pixels * bpp;
+	uint8_t *buf = k_malloc(buf_sz);
+
+	if (!buf) {
+		return;
+	}
+	for (size_t i = 0; i < pixels; i++) {
+		set_pixel_color(buf, i * bpp, caps->current_pixel_format, color);
+	}
+	struct display_buffer_descriptor desc = {
+		.buf_size = buf_sz,
+		.width = w,
+		.height = h,
+		.pitch = w,
+	};
+
+	display_write(dev, x, y, &desc, buf);
+	k_free(buf);
+}

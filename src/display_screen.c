@@ -1,14 +1,102 @@
 #include "display_screen.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <string.h>
 #include <zephyr/kernel.h>
 
 #include "app_version.h"
 #include "build_version.h"
 #include "display_text.h"
+#if defined(CONFIG_GOLIOTH_OTA)
+#include "golioth_ui.h"
+#include "ota_download_ui.h"
+#endif
 
 #define STANDBY_TEXT_MAX_LEN 24
+
+/* Avoid full-screen gray refresh every tick: paint static updating UI once, then only the bar band. */
+#define UPDATING_PCT_SENTINEL 101U
+
+static unsigned s_updating_last_pct = UPDATING_PCT_SENTINEL;
+static bool s_updating_painted;
+
+void display_screen_updating_invalidate(void)
+{
+	s_updating_last_pct = UPDATING_PCT_SENTINEL;
+	s_updating_painted = false;
+}
+
+#if defined(CONFIG_GOLIOTH_OTA)
+/* Gap between bar bottom and centered % text (bar_y unchanged vs. previous layout). */
+#define UPDATING_PCT_BELOW_GAP 4U
+
+struct updating_bar_layout {
+	uint16_t y_title;
+	uint16_t bar_x;
+	uint16_t bar_y;
+	uint16_t bar_w;
+	uint16_t bar_h;
+	uint16_t pct_y;
+	bool valid;
+};
+
+static void updating_compute_bar_layout(uint16_t screen_w, uint16_t screen_h,
+					const struct display_screen_ctx *ctx,
+					struct updating_bar_layout *out)
+{
+	const uint16_t bar_h = 12U;
+	const uint16_t block_gap = 8U;
+	const uint16_t margin = 8U;
+	const uint16_t block_h = (uint16_t)(ctx->glyph_h + block_gap + bar_h);
+
+	out->y_title = (screen_h > block_h) ? (uint16_t)((screen_h - block_h) / 2U) : 0U;
+	out->bar_h = bar_h;
+	out->bar_w = (uint16_t)(screen_w - 2U * margin);
+	out->bar_x = (uint16_t)((screen_w > out->bar_w) ? (screen_w - out->bar_w) / 2U : 0U);
+	out->bar_y = (uint16_t)(out->y_title + ctx->glyph_h + block_gap);
+	out->pct_y = (uint16_t)(out->bar_y + out->bar_h + UPDATING_PCT_BELOW_GAP);
+	out->valid = (out->bar_w > 4U) &&
+		     ((uint32_t)out->pct_y + FONT_H <= screen_h);
+}
+
+static void updating_draw_progress_only(const struct device *display_dev,
+					const struct display_capabilities *capabilities,
+					const struct display_screen_ctx *ctx,
+					const struct updating_bar_layout *layout, unsigned pct)
+{
+	const uint16_t screen_w = capabilities->x_resolution;
+	const uint16_t fill_w = (uint16_t)(((uint32_t)pct * (uint32_t)layout->bar_w) / 100U);
+	char pct_str[8];
+
+	snprintk(pct_str, sizeof(pct_str), "%u%%", pct);
+
+	const uint16_t text_w = (uint16_t)(strlen(pct_str) * FONT_W);
+	const uint16_t pct_x = text_center_x(screen_w, text_w);
+
+	const uint16_t bar_r = (uint16_t)(layout->bar_x + layout->bar_w);
+	const uint16_t text_r = (uint16_t)(pct_x + text_w);
+	const uint16_t box_left = (layout->bar_x < pct_x) ? layout->bar_x : pct_x;
+	const uint16_t box_right = (bar_r > text_r) ? bar_r : text_r;
+	const uint16_t box_w = (uint16_t)(box_right - box_left);
+	const uint16_t box_y = layout->bar_y;
+	const uint16_t text_bottom = (uint16_t)(layout->pct_y + FONT_H);
+	const uint16_t bar_bottom = (uint16_t)(layout->bar_y + layout->bar_h);
+	const uint16_t box_bottom = (text_bottom > bar_bottom) ? text_bottom : bar_bottom;
+	const uint16_t box_h = (uint16_t)(box_bottom - box_y);
+
+	display_solid_rect(display_dev, capabilities, box_left, box_y, box_w, box_h, COLOR_GRAY);
+	display_solid_rect(display_dev, capabilities, layout->bar_x, layout->bar_y, layout->bar_w,
+			   layout->bar_h, COLOR_BLACK);
+	if (fill_w > 0U) {
+		display_solid_rect(display_dev, capabilities, layout->bar_x, layout->bar_y, fill_w,
+				   layout->bar_h, COLOR_GREEN);
+	}
+
+	display_text(display_dev, capabilities, pct_str, pct_x, layout->pct_y, COLOR_WHITE,
+		     COLOR_GRAY, ctx->text_buf, ctx->bpp, 1, 1);
+}
+#endif /* CONFIG_GOLIOTH_OTA */
 
 static void format_build_time(char *dst, size_t size)
 {
@@ -146,11 +234,21 @@ int display_screen_render_boot(const struct device *display_dev,
 	display_text(display_dev, capabilities, build_str, text_center_x(screen_w, build_w), ctx->glyph_h + 8,
 		     COLOR_WHITE, COLOR_BLACK, ctx->text_buf, ctx->bpp, 1, 1);
 
-	const char *prompt_str = "Button2: Start";
-	uint16_t prompt_w = strlen(prompt_str) * ctx->glyph_w;
-	display_text(display_dev, capabilities, prompt_str,
+#if defined(CONFIG_GOLIOTH_OTA)
+	struct golioth_ui_standby_line line;
+
+	golioth_ui_standby_get_line(&line);
+#else
+	struct {
+		const char *text;
+		uint32_t fg;
+		uint32_t bg;
+	} line = { "Firmware up-to-date", COLOR_YELLOW, COLOR_BLACK };
+#endif
+	uint16_t prompt_w = strlen(line.text) * ctx->glyph_w;
+	display_text(display_dev, capabilities, line.text,
 		     text_center_x(screen_w, prompt_w), (ctx->glyph_h << 1) + 16,
-		     COLOR_YELLOW, COLOR_BLUE, ctx->text_buf, ctx->bpp, ctx->scale_num, ctx->scale_den);
+		     line.fg, line.bg, ctx->text_buf, ctx->bpp, ctx->scale_num, ctx->scale_den);
 	return 0;
 }
 
@@ -172,12 +270,76 @@ void display_screen_render_updating(const struct device *display_dev,
 				    const struct display_capabilities *capabilities,
 				    const struct display_screen_ctx *ctx)
 {
-	fill_display_solid(display_dev, capabilities, COLOR_GRAY);
-	if (ctx->text_buf) {
-		display_text(display_dev, capabilities, "Updating FW...",
-			     text_center_x(capabilities->x_resolution, strlen("Updating FW...") * ctx->glyph_w),
-			     capabilities->y_resolution / 2 - ctx->glyph_h / 2,
-			     COLOR_RED, COLOR_GRAY, ctx->text_buf, ctx->bpp,
-			     ctx->scale_num, ctx->scale_den);
+	const uint16_t screen_w = capabilities->x_resolution;
+	const uint16_t screen_h = capabilities->y_resolution;
+
+	if (!ctx->text_buf) {
+		return;
 	}
+
+	const uint16_t title_w = (uint16_t)(strlen("Updating Firmware") * ctx->glyph_w);
+	uint16_t y_title;
+
+#if defined(CONFIG_GOLIOTH_OTA)
+	struct updating_bar_layout layout;
+	bool has_bar = false;
+
+	if (ota_download_ui_has_total()) {
+		updating_compute_bar_layout(screen_w, screen_h, ctx, &layout);
+		has_bar = layout.valid;
+		if (has_bar) {
+			y_title = layout.y_title;
+		} else {
+			y_title = (uint16_t)(screen_h / 2U - ctx->glyph_h / 2U);
+		}
+	} else {
+		y_title = (uint16_t)(screen_h / 2U - ctx->glyph_h / 2U);
+	}
+
+	const unsigned pct = has_bar ? ota_download_ui_percent() : 0U;
+
+	/* Title-only (e.g. MCUmgr): one full paint, then idle. */
+	if (!has_bar) {
+		if (s_updating_painted) {
+			return;
+		}
+		fill_display_solid(display_dev, capabilities, COLOR_GRAY);
+		display_text(display_dev, capabilities, "Updating Firmware",
+			     text_center_x(screen_w, title_w), y_title, COLOR_RED, COLOR_GRAY,
+			     ctx->text_buf, ctx->bpp, ctx->scale_num, ctx->scale_den);
+		s_updating_painted = true;
+		s_updating_last_pct = UPDATING_PCT_SENTINEL;
+		return;
+	}
+
+	/* New download or first paint with bar: full gray + static + bar. */
+	if (!s_updating_painted || pct < s_updating_last_pct) {
+		fill_display_solid(display_dev, capabilities, COLOR_GRAY);
+		display_text(display_dev, capabilities, "Updating Firmware",
+			     text_center_x(screen_w, title_w), y_title, COLOR_RED, COLOR_GRAY,
+			     ctx->text_buf, ctx->bpp, ctx->scale_num, ctx->scale_den);
+		updating_draw_progress_only(display_dev, capabilities, ctx, &layout, pct);
+		s_updating_painted = true;
+		s_updating_last_pct = pct;
+		return;
+	}
+
+	if (pct == s_updating_last_pct) {
+		return;
+	}
+
+	updating_draw_progress_only(display_dev, capabilities, ctx, &layout, pct);
+	s_updating_last_pct = pct;
+#else
+	y_title = (uint16_t)(screen_h / 2U - ctx->glyph_h / 2U);
+
+	if (s_updating_painted) {
+		return;
+	}
+	fill_display_solid(display_dev, capabilities, COLOR_GRAY);
+	display_text(display_dev, capabilities, "Updating Firmware",
+		     text_center_x(screen_w, title_w), y_title, COLOR_RED, COLOR_GRAY, ctx->text_buf,
+		     ctx->bpp, ctx->scale_num, ctx->scale_den);
+	s_updating_painted = true;
+#endif
 }

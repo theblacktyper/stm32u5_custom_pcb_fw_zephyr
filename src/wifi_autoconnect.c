@@ -16,6 +16,8 @@
 #include <zephyr/net/wifi_mgmt.h>
 #include <zephyr/net/net_event.h>
 
+#include "wifi_link.h"
+
 LOG_MODULE_REGISTER(wifi_autoconnect, LOG_LEVEL_INF);
 
 #if defined(CONFIG_WIFI_AUTOCONNECT)
@@ -121,7 +123,7 @@ static void wifi_autoconnect_thread(void *p1, void *p2, void *p3)
 
 	if (num_nets == 0) {
 		LOG_INF("No SSIDs configured — skipping auto-connect");
-		return;
+		goto thread_idle;
 	}
 
 	net_mgmt_init_event_callback(&wifi_mgmt_cb, wifi_event_handler,
@@ -132,13 +134,13 @@ static void wifi_autoconnect_thread(void *p1, void *p2, void *p3)
 
 	if (iface == NULL) {
 		LOG_ERR("No WiFi interface found");
-		return;
+		goto thread_idle;
 	}
 
 	k_msleep(2000);
 
-	LOG_INF("Auto-connect: %d network(s) configured, retry timeout %d s",
-		num_nets, RETRY_TIMEOUT_S);
+	// LOG_INF("Auto-connect: %d network(s) configured, retry timeout %d s",
+	// 	num_nets, RETRY_TIMEOUT_S);
 
 	int64_t deadline = k_uptime_get() + (int64_t)RETRY_TIMEOUT_S * 1000;
 	int attempt = 0;
@@ -151,15 +153,17 @@ static void wifi_autoconnect_thread(void *p1, void *p2, void *p3)
 				continue;
 			}
 
-			LOG_INF("Attempt %d: trying \"%s\" ...",
-				attempt, networks[i].ssid);
+			// LOG_INF("Attempt %d: trying \"%s\" ...",
+			// 	attempt, networks[i].ssid);
 
 			int ret = try_connect(iface, &networks[i]);
 
 			if (ret == 0) {
-				LOG_INF("WiFi connected to \"%s\"",
+				LOG_INF("WiFi connected to \"%s\"\n",
 					networks[i].ssid);
-				return;
+				/* Let Golioth / DHCP run only after association (avoid racing DHCP on ESP-AT). */
+				wifi_link_signal_connected();
+				goto thread_idle;
 			}
 
 			LOG_WRN("Failed to connect to \"%s\" (err %d)",
@@ -190,6 +194,12 @@ static void wifi_autoconnect_thread(void *p1, void *p2, void *p3)
 	}
 
 	LOG_WRN("Gave up WiFi auto-connect after %d round(s)", attempt);
+
+thread_idle:
+	/* Zephyr thread entry points must not return — undefined behavior / abort(). */
+	for (;;) {
+		k_sleep(K_FOREVER);
+	}
 }
 
 #define WIFI_AUTOCONNECT_STACKSIZE 1024

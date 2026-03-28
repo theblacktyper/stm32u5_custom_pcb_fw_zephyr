@@ -5,6 +5,13 @@
 
 #include "display_text.h"
 
+#if defined(CONFIG_WIFI_AUTOCONNECT)
+#include "wifi_link.h"
+#endif
+#if defined(CONFIG_GOLIOTH_OTA)
+#include "golioth_ui.h"
+#endif
+
 static void set_display_pixel_rgb565(uint8_t *dst, uint16_t dx, uint16_t dy,
 				     uint32_t color)
 {
@@ -45,6 +52,56 @@ static void draw_string_on_rgb565(uint8_t *dst, uint16_t x0, uint16_t y0,
 		}
 	}
 }
+
+static void fill_rect_rgb565(uint8_t *dst, uint16_t x0, uint16_t y0, uint16_t w, uint16_t h,
+			     uint32_t color)
+{
+	for (uint16_t row = 0; row < h; row++) {
+		for (uint16_t col = 0; col < w; col++) {
+			set_display_pixel_rgb565(dst, x0 + col, y0 + row, color);
+		}
+	}
+}
+
+#if defined(CONFIG_WIFI_AUTOCONNECT)
+/* Signal-style bars, top-right of the scaled preview region (RGB565 buffer coordinates). */
+#define WIFI_BAR_W      3U
+#define WIFI_BAR_GAP    2U
+#define WIFI_BAR_COUNT  4U
+#define WIFI_BAR_BASE_H 4U
+#define WIFI_BAR_STEP   3U
+#define WIFI_BAR_MARGIN 4U
+
+static void draw_wifi_link_bars_rgb565(uint8_t *dst)
+{
+	if (!wifi_link_preview_connected()) {
+		return;
+	}
+
+	uint32_t fg = COLOR_GREEN;
+#if defined(CONFIG_GOLIOTH_OTA)
+	if (!golioth_ui_cloud_connected()) {
+		fg = COLOR_WHITE;
+	}
+#endif
+	const uint16_t total_w =
+		WIFI_BAR_COUNT * WIFI_BAR_W + (WIFI_BAR_COUNT - 1U) * WIFI_BAR_GAP;
+	const uint16_t max_h = WIFI_BAR_BASE_H + (WIFI_BAR_COUNT - 1U) * WIFI_BAR_STEP;
+
+	const uint16_t x_left =
+		(uint16_t)(FRAME_X_OFFSET + FRAME_DISP_W - WIFI_BAR_MARGIN - total_w);
+	const uint16_t y_top = (uint16_t)(FRAME_Y_OFFSET + WIFI_BAR_MARGIN);
+	const uint16_t y_bottom = (uint16_t)(y_top + max_h - 1U);
+
+	for (unsigned i = 0; i < WIFI_BAR_COUNT; i++) {
+		uint16_t h = (uint16_t)(WIFI_BAR_BASE_H + i * WIFI_BAR_STEP);
+		uint16_t x = (uint16_t)(x_left + i * (WIFI_BAR_W + WIFI_BAR_GAP));
+		uint16_t y = (uint16_t)(y_bottom + 1U - h);
+
+		fill_rect_rgb565(dst, x, y, WIFI_BAR_W, h, fg);
+	}
+}
+#endif
 
 static int clamp_pct(int val)
 {
@@ -159,4 +216,8 @@ void copy_frame_to_display(const uint8_t *src, uint8_t *dst,
 #endif
 
 	draw_person_overlay(dst, person_score, no_person_score, inference_enabled);
+
+#if defined(CONFIG_WIFI_AUTOCONNECT)
+	draw_wifi_link_bars_rgb565(dst);
+#endif
 }

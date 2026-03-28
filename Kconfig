@@ -66,3 +66,47 @@ config WIFI_AUTOCONNECT_RETRY_TIMEOUT_S
 	  Set to 0 to try only once.
 
 endmenu
+
+if GOLIOTH_OTA
+
+config GOLIOTH_APP_PSK_ID
+	string "Golioth PSK identity (device credentials)"
+	default "my-psk-id"
+	help
+	  Lab-only: copy from Golioth Console device details. Use per-device
+	  provisioning for production (not hardcoded secrets).
+
+config GOLIOTH_APP_PSK
+	string "Golioth PSK secret"
+	default "my-psk"
+	help
+	  Lab-only: device pre-shared key. Replace with secure storage for production.
+
+config GOLIOTH_FW_UPDATE_PACKAGE_NAME
+	string "Golioth firmware package name"
+	default "main"
+	help
+	  Must match the package name in Golioth Console (Firmware Updates).
+
+config GOLIOTH_FW_UPDATE_OBSERVATION_RETRY_MAX_DELAY_S
+	int "Maximum delay before retrying OTA manifest observation (seconds)"
+	default 300
+
+config GOLIOTH_FW_UPDATE_THREAD_STACK_SIZE
+	int "Golioth OTA thread stack size"
+	default 4096
+
+config GOLIOTH_FW_UPDATE_ROLLBACK_TIMER_S
+	int "FW update rollback timer (seconds) if Golioth unreachable after boot"
+	default 300
+
+config GOLIOTH_FW_UPDATE_IDLE_DISCONNECT
+	bool "Stop Golioth client when up to date or package missing from manifest"
+	default n
+	help
+	  After a manifest, call golioth_client_stop() when there is nothing useful to do:
+	  cohort target version equals APP_VERSION, or the configured package name is absent from
+	  the manifest. Reduces Wi-Fi traffic; new deployments are not detected until reboot
+	  (or future reconnect logic).
+
+endif # GOLIOTH_OTA

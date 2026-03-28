@@ -6,6 +6,6 @@
 #ifndef APP_VERSION_H
 #define APP_VERSION_H
 
-#define APP_VERSION "2.2.0"  /* v2.2.x : Major refactoring + all features from v2.0.x */
+#define APP_VERSION "3.0.0"
 
 #endif /* APP_VERSION_H */
