@@ -10,6 +10,7 @@
 static atomic_t golioth_cloud_connected;
 static atomic_t golioth_has_connected_once;
 static atomic_t golioth_client_started;
+static atomic_t golioth_reboot_pending_after_ota_confirm;
 
 void golioth_ui_set_cloud_connected(bool connected)
 {
@@ -27,6 +28,16 @@ bool golioth_ui_cloud_connected(void)
 void golioth_ui_set_client_started(bool started)
 {
 	atomic_set(&golioth_client_started, started ? 1 : 0);
+}
+
+void golioth_ui_set_pending_reboot_after_ota_confirm(void)
+{
+	atomic_set(&golioth_reboot_pending_after_ota_confirm, 1);
+}
+
+bool golioth_ui_consume_pending_reboot_after_ota_confirm(void)
+{
+	return atomic_cas(&golioth_reboot_pending_after_ota_confirm, 1, 0);
 }
 
 static uint8_t standby_compute_phase(void)

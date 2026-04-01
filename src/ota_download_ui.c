@@ -4,6 +4,7 @@
 
 static atomic_t ota_bytes_done;
 static atomic_t ota_bytes_total;
+static atomic_t ota_applying;
 
 void ota_download_ui_set_progress(size_t downloaded, size_t total)
 {
@@ -15,6 +16,17 @@ void ota_download_ui_clear(void)
 {
 	atomic_set(&ota_bytes_done, 0);
 	atomic_set(&ota_bytes_total, 0);
+	atomic_set(&ota_applying, 0);
+}
+
+void ota_download_ui_set_applying(bool applying)
+{
+	atomic_set(&ota_applying, applying ? 1 : 0);
+}
+
+bool ota_download_ui_is_applying(void)
+{
+	return atomic_get(&ota_applying) != 0;
 }
 
 bool ota_download_ui_has_total(void)

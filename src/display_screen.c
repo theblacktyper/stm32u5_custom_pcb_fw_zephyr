@@ -20,11 +20,31 @@
 
 static unsigned s_updating_last_pct = UPDATING_PCT_SENTINEL;
 static bool s_updating_painted;
+#if defined(CONFIG_GOLIOTH_OTA)
+/* Tracks last drawn "Applying Update" vs "Updating Firmware" for partial refresh paths. */
+static bool s_updating_title_applying;
+#endif
 
 void display_screen_updating_invalidate(void)
 {
 	s_updating_last_pct = UPDATING_PCT_SENTINEL;
 	s_updating_painted = false;
+#if defined(CONFIG_GOLIOTH_OTA)
+	s_updating_title_applying = false;
+#endif
+}
+
+/*
+ * Erase the full title row before drawing a new title string. Required when the new string is
+ * shorter than the old one — display_text only writes the new width; leftover pixels must not
+ * remain visible.
+ */
+static void updating_clear_title_band(const struct device *display_dev,
+				      const struct display_capabilities *capabilities,
+				      uint16_t screen_w, uint16_t y_title,
+				      const struct display_screen_ctx *ctx)
+{
+	display_solid_rect(display_dev, capabilities, 0, y_title, screen_w, ctx->glyph_h, COLOR_GRAY);
 }
 
 #if defined(CONFIG_GOLIOTH_OTA)
@@ -277,10 +297,11 @@ void display_screen_render_updating(const struct device *display_dev,
 		return;
 	}
 
-	const uint16_t title_w = (uint16_t)(strlen("Updating Firmware") * ctx->glyph_w);
 	uint16_t y_title;
 
 #if defined(CONFIG_GOLIOTH_OTA)
+	const char *title = ota_download_ui_is_applying() ? "Applying Update" : "Updating Firmware";
+	const uint16_t title_w = (uint16_t)(strlen(title) * ctx->glyph_w);
 	struct updating_bar_layout layout;
 	bool has_bar = false;
 
@@ -304,39 +325,55 @@ void display_screen_render_updating(const struct device *display_dev,
 			return;
 		}
 		fill_display_solid(display_dev, capabilities, COLOR_GRAY);
-		display_text(display_dev, capabilities, "Updating Firmware",
+		updating_clear_title_band(display_dev, capabilities, screen_w, y_title, ctx);
+		display_text(display_dev, capabilities, title,
 			     text_center_x(screen_w, title_w), y_title, COLOR_RED, COLOR_GRAY,
 			     ctx->text_buf, ctx->bpp, ctx->scale_num, ctx->scale_den);
 		s_updating_painted = true;
 		s_updating_last_pct = UPDATING_PCT_SENTINEL;
+		s_updating_title_applying = ota_download_ui_is_applying();
 		return;
 	}
 
 	/* New download or first paint with bar: full gray + static + bar. */
 	if (!s_updating_painted || pct < s_updating_last_pct) {
 		fill_display_solid(display_dev, capabilities, COLOR_GRAY);
-		display_text(display_dev, capabilities, "Updating Firmware",
+		updating_clear_title_band(display_dev, capabilities, screen_w, y_title, ctx);
+		display_text(display_dev, capabilities, title,
 			     text_center_x(screen_w, title_w), y_title, COLOR_RED, COLOR_GRAY,
 			     ctx->text_buf, ctx->bpp, ctx->scale_num, ctx->scale_den);
 		updating_draw_progress_only(display_dev, capabilities, ctx, &layout, pct);
 		s_updating_painted = true;
 		s_updating_last_pct = pct;
+		s_updating_title_applying = ota_download_ui_is_applying();
 		return;
 	}
 
+	/* Same % as last frame; skip redraw unless title text changed (e.g. shorter string). */
 	if (pct == s_updating_last_pct) {
+		if (ota_download_ui_is_applying() == s_updating_title_applying) {
+			return;
+		}
+		updating_clear_title_band(display_dev, capabilities, screen_w, y_title, ctx);
+		display_text(display_dev, capabilities, title,
+			     text_center_x(screen_w, title_w), y_title, COLOR_RED, COLOR_GRAY,
+			     ctx->text_buf, ctx->bpp, ctx->scale_num, ctx->scale_den);
+		s_updating_title_applying = ota_download_ui_is_applying();
 		return;
 	}
 
 	updating_draw_progress_only(display_dev, capabilities, ctx, &layout, pct);
 	s_updating_last_pct = pct;
 #else
+	const uint16_t title_w = (uint16_t)(strlen("Updating Firmware") * ctx->glyph_w);
+
 	y_title = (uint16_t)(screen_h / 2U - ctx->glyph_h / 2U);
 
 	if (s_updating_painted) {
 		return;
 	}
 	fill_display_solid(display_dev, capabilities, COLOR_GRAY);
+	updating_clear_title_band(display_dev, capabilities, screen_w, y_title, ctx);
 	display_text(display_dev, capabilities, "Updating Firmware",
 		     text_center_x(screen_w, title_w), y_title, COLOR_RED, COLOR_GRAY, ctx->text_buf,
 		     ctx->bpp, ctx->scale_num, ctx->scale_den);

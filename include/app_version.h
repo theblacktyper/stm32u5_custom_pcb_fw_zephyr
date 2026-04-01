@@ -6,6 +6,6 @@
 #ifndef APP_VERSION_H
 #define APP_VERSION_H
 
-#define APP_VERSION "3.1.0"  /* Reduced to 1 count of frame buffer to preserve RAM */
+#define APP_VERSION "3.1.1"  /* UI enhancements + 1 count frame buffer */
 
 #endif /* APP_VERSION_H */

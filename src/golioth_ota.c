@@ -8,6 +8,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/net/net_if.h>
+#include <zephyr/sys/reboot.h>
 #include <zephyr/net/dhcpv4.h>
 #include <zephyr/net/net_event.h>
 #include <zephyr/net/net_mgmt.h>
@@ -84,6 +85,11 @@ static void on_client_event(struct golioth_client *client, enum golioth_client_e
 	} else if (event == GOLIOTH_CLIENT_EVENT_DISCONNECTED) {
 		golioth_ui_set_cloud_connected(false);
 		LOG_DBG("Golioth client disconnected (cloud indicator: white)");
+		if (golioth_ui_consume_pending_reboot_after_ota_confirm()) {
+			/* LOG_LEVEL_ERR: this module is ERR-only; use ERR so message is visible. */
+			LOG_ERR("Post-OTA confirm: rebooting (pending flag after \"Firmware updated successfully!\")");
+			sys_reboot(SYS_REBOOT_WARM);
+		}
 	}
 }
 

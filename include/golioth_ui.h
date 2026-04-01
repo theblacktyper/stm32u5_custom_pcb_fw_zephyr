@@ -28,4 +28,12 @@ struct golioth_ui_standby_line {
 
 void golioth_ui_standby_get_line(struct golioth_ui_standby_line *out);
 
+/**
+ * After first-boot OTA confirm, fw_update logs "Firmware updated successfully!" and calls this.
+ * The next Golioth client disconnect should trigger a warm reboot (see golioth_ota on_client_event).
+ */
+void golioth_ui_set_pending_reboot_after_ota_confirm(void);
+/** If a pending reboot was requested, clear it and return true (for disconnect handler). */
+bool golioth_ui_consume_pending_reboot_after_ota_confirm(void);
+
 #endif /* GOLIOTH_UI_H_ */
