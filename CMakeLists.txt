@@ -48,6 +48,7 @@ target_include_directories(app PRIVATE
 )
 
 target_sources(app PRIVATE src/main.c)
+target_sources(app PRIVATE src/golioth_capture_prompt_sync.c)
 target_sources(app PRIVATE src/app_runtime.c)
 target_sources(app PRIVATE src/camera_pipeline.c)
 target_sources(app PRIVATE src/camera_runtime.c)

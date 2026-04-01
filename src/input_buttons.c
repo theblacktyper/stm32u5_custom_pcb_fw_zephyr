@@ -7,7 +7,7 @@
 #include "camera_runtime.h"
 #include "dfu_state.h"
 
-LOG_MODULE_DECLARE(main);
+LOG_MODULE_DECLARE(main, LOG_LEVEL_INF);
 
 #define SW0_NODE DT_ALIAS(sw0)
 #define SW1_NODE DT_ALIAS(sw1)

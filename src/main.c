@@ -20,6 +20,9 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #include "dfu_state.h"
 #include "input_buttons.h"
 #include "status_led.h"
+#if defined(CONFIG_GOLIOTH_OTA)
+#include "golioth_capture_prompt_sync.h"
+#endif
 
 int main(void)
 {
@@ -40,6 +43,12 @@ int main(void)
 	}
 
 	// LOG_INF("====== Threads STARTING ======");
+#if defined(CONFIG_GOLIOTH_OTA)
+	/* After fw_update logs (e.g. "Golioth client stopped..." on idle disconnect). */
+	if (k_sem_take(&golioth_capture_prompt_sem, K_SECONDS(120)) != 0) {
+		LOG_WRN("Timed out waiting for fw_update; printing capture prompt anyway");
+	}
+#endif
 	LOG_INF("Press Button 2 to start capture...\n");
 
 	return 0;

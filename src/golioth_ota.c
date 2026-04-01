@@ -23,7 +23,7 @@
 #endif
 
 /* Name must differ from Golioth SDK's ota.c (LOG_MODULE_REGISTER(golioth_ota)) — duplicate symbols at link. */
-LOG_MODULE_REGISTER(dbg_golioth_ota, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(dbg_golioth_ota, LOG_LEVEL_ERR);
 
 static K_SEM_DEFINE(ipv4_ready, 0, 1);
 static K_SEM_DEFINE(golioth_connected, 0, 1);

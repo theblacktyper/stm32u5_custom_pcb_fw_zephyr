@@ -1,6 +1,5 @@
 #include "camera_runtime.h"
 
-#include <math.h>
 #include <string.h>
 
 #include <zephyr/drivers/display.h>
@@ -18,17 +17,19 @@
 #include "tflm_hello_world/model_settings.h"
 #endif
 
-LOG_MODULE_DECLARE(main);
+LOG_MODULE_REGISTER(app_stats, LOG_LEVEL_INF);
 
 static volatile uint8_t is_cam_capture_started;
 static atomic_t show_camera_frame = ATOMIC_INIT(0);
 static K_SEM_DEFINE(capture_sem, 0, 1);
 
-/* FPS measurement */
+/* FPS measurement (disabled: log printout) */
+#if 0
 static uint32_t frame_count;
 static int64_t fps_start_ms;
 static float fps_current;
 static float fps_last_logged = -1.0f;
+#endif
 
 /* Most recent frame handed off from camera_thread to inference_thread. */
 #if defined(CONFIG_APP_ENABLE_INFERENCE) && CONFIG_APP_ENABLE_INFERENCE
@@ -39,7 +40,7 @@ static atomic_t inference_pending = ATOMIC_INIT(0);
 static K_SEM_DEFINE(buffer_returned_sem, 0, 1);
 #endif
 static K_SEM_DEFINE(inference_frame_ready_sem, 0, 1);
-#define INFERENCE_EVERY_N_FRAMES 4
+#define INFERENCE_EVERY_N_FRAMES 2//if things slow down, restore this value to 4
 static uint32_t inference_frame_counter;
 static bool last_frame_handed_off;
 static int8_t latest_person_score;
@@ -138,8 +139,10 @@ void camera_runtime_thread(void)
 		}
 	}
 
+#if 0
 	frame_count = 0;
 	fps_start_ms = k_uptime_get();
+#endif
 #if (CONFIG_VIDEO_BUFFER_POOL_NUM_MAX == 1) && defined(CONFIG_APP_ENABLE_INFERENCE) && CONFIG_APP_ENABLE_INFERENCE
 	static bool first_capture = true;
 #endif
@@ -175,24 +178,6 @@ void camera_runtime_thread(void)
 		first_capture = false;
 #endif
 
-#if defined(CONFIG_APP_ENABLE_INFERENCE) && CONFIG_APP_ENABLE_INFERENCE
-		bool run_inference = (inference_frame_counter % INFERENCE_EVERY_N_FRAMES) == 0;
-		if (run_inference && !atomic_get(&inference_pending)) {
-			k_mutex_lock(&camera_runtime_inference_vbuf_mutex, K_FOREVER);
-			inference_vbuf = vbuf;
-			atomic_set(&inference_pending, 1);
-			k_mutex_unlock(&camera_runtime_inference_vbuf_mutex);
-			k_sem_give(&inference_frame_ready_sem);
-			last_frame_handed_off = true;
-		} else {
-			video_enqueue(video_dev, vbuf);
-			last_frame_handed_off = false;
-		}
-		inference_frame_counter++;
-#else
-		video_enqueue(video_dev, vbuf);
-#endif
-
 		int8_t person_score = latest_person_score;
 		int8_t no_person_score = latest_no_person_score;
 		copy_frame_to_display(vbuf->buffer, disp_buf, person_score, no_person_score, true);
@@ -211,6 +196,7 @@ void camera_runtime_thread(void)
 		};
 		display_write(disp, 0, 0, &desc, disp_buf);
 
+#if 0
 		frame_count++;
 		int64_t elapsed = k_uptime_get() - fps_start_ms;
 		if (elapsed >= 1000) {
@@ -222,6 +208,25 @@ void camera_runtime_thread(void)
 				fps_last_logged = fps_current;
 			}
 		}
+#endif
+
+#if defined(CONFIG_APP_ENABLE_INFERENCE) && CONFIG_APP_ENABLE_INFERENCE
+		bool run_inference = (inference_frame_counter % INFERENCE_EVERY_N_FRAMES) == 0;
+		if (run_inference && !atomic_get(&inference_pending)) {
+			k_mutex_lock(&camera_runtime_inference_vbuf_mutex, K_FOREVER);
+			inference_vbuf = vbuf;
+			atomic_set(&inference_pending, 1);
+			k_mutex_unlock(&camera_runtime_inference_vbuf_mutex);
+			k_sem_give(&inference_frame_ready_sem);
+			last_frame_handed_off = true;
+		} else {
+			video_enqueue(video_dev, vbuf);
+			last_frame_handed_off = false;
+		}
+		inference_frame_counter++;
+#else
+		video_enqueue(video_dev, vbuf);
+#endif
 	}
 }
 
@@ -229,6 +234,13 @@ void inference_thread_entry(void)
 {
 #if defined(CONFIG_APP_ENABLE_INFERENCE) && CONFIG_APP_ENABLE_INFERENCE
 	tflm_person_detection_setup();
+#if 0
+	uint32_t inference_completed_count;
+	int64_t inference_stats_start_ms;
+
+	inference_completed_count = 0;
+	inference_stats_start_ms = k_uptime_get();
+#endif
 	while (1) {
 		if (dfu_should_suspend()) {
 			k_thread_suspend(k_current_get());
@@ -268,6 +280,23 @@ void inference_thread_entry(void)
 			latest_person_score = person_score;
 			latest_no_person_score = no_person_score;
 		}
+#if 0
+		inference_completed_count++;
+		{
+			int64_t elapsed_inf = k_uptime_get() - inference_stats_start_ms;
+
+			if (elapsed_inf >= 1000) {
+				float inf_per_sec =
+					(float)inference_completed_count * 1000.0f / (float)elapsed_inf;
+
+				LOG_INF("Inference: %.1f/s (completed %u in %" PRId64 " ms)",
+					(double)inf_per_sec, inference_completed_count,
+					elapsed_inf);
+				inference_completed_count = 0;
+				inference_stats_start_ms = k_uptime_get();
+			}
+		}
+#endif
 		video_enqueue(video_dev, vbuf);
 #if (CONFIG_VIDEO_BUFFER_POOL_NUM_MAX == 1)
 		k_sem_give(&buffer_returned_sem);
